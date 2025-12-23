@@ -630,7 +630,7 @@ if __name__ == '__main__':
     Usage example
     """
     # Configure paths
-    data_root = r'f:\ultrasound\Foundation-Model-Challenge-for-Ultrasound-Image-Analysis\data\train'
+    data_root = '/proj/uppmax2025-2-369/Cgrain/ult/data/train'
     pred_root = 'predictions_new_new/'
     output_file = 'evaluation_results.json'
     summary_file = 'evaluation_summary.txt'

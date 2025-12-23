@@ -1,2 +1,7 @@
 data/
 *.pyc
+MTUS-Net/
+MTUS-Net.zip
+docker/best_model.pth
+docker/
+best_model.pth

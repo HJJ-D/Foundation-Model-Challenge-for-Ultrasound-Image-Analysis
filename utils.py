@@ -77,7 +77,7 @@ def calculate_dice_coefficient(y_true, y_pred_logits):
     dice = (2. * intersection + 1e-6) / (union + 1e-6)
     return dice.item()
 
-def calculate_mae(y_true, y_pred, image_size=(256, 256)):
+def calculate_mae(y_true, y_pred, image_size=(224, 224)):
     h, w = image_size
     y_true_px = y_true.cpu().numpy().copy()
     y_pred_px = y_pred.cpu().numpy().copy()

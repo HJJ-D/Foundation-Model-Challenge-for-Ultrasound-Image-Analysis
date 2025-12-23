@@ -215,10 +215,7 @@ docker build -f Dockerfile -t my-submission:latest .
 ./run_test.sh /path/to/validation /path/to/output
 
 # Method 2: Manual run
-docker run --gpus all --rm \
-  -v /path/to/validation:/input/:ro \
-  -v /path/to/output:/output \
-  my-submission:latest
+docker run --gpus all --rm -v D:\ultrasound\val:/input/:ro -v D:\ultrasound\output:/output  my-submission:latest
 ```
 
 ### Step 4: Validate Output Format

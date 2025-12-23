@@ -128,7 +128,7 @@ class Model:
         
         # Define data preprocessing transforms (no augmentation for inference)
         self.transforms = A.Compose([
-            A.Resize(256, 256),
+            A.Resize(224, 224),  # Swin-Base expects 224x224 input
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2(),
         ])
@@ -189,7 +189,7 @@ class Model:
         # Create and load model
         print(f"\nLoading model...")
         self.model = MultiTaskModelFactory(
-            encoder_name='efficientnet-b4',
+            encoder_name='swin_b',
             encoder_weights=None,
             task_configs=self.task_configs
         ).to(self.device)
@@ -457,7 +457,7 @@ if __name__ == '__main__':
     Usage example
     """
     # Set paths
-    data_root = r'f:\ultrasound\Foundation-Model-Challenge-for-Ultrasound-Image-Analysis\data\train'
+    data_root = '/proj/uppmax2025-2-369/Cgrain/ult/data/train'
     output_dir = 'predictions_new_new/'
     batch_size = 8
     

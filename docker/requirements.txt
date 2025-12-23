@@ -12,7 +12,10 @@ albumentations==2.0.8
 pillow==10.2.0
 
 # Segmentation Models
-segmentation-models-pytorch==0.5.0
+segmentation-models-pytorch>=0.5.0
+
+# Timm for additional encoders (Swin, etc.)
+timm>=0.9.0
 
 # Data Processing
 numpy==1.26.4

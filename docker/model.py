@@ -1,4 +1,4 @@
-# model.py - Docker Version - Foundation Model Challenge for Ultrasound Image Analysis (FMC_UIA)
+# Sample Code Submission for Foundation Model Challenge for Ultrasound Image Analysis (FMC_UIA)
 
 import torch
 import torch.nn as nn
@@ -9,7 +9,6 @@ import json
 import numpy as np
 import pandas as pd
 import glob
-import time
 from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -47,10 +46,15 @@ class InferenceDataset(Dataset):
         task_id = record['task_id']
         task_name = record['task_name']
         
-        # Load image
+        # Load image with Unicode path support
         image_rel_path = record['image_path']
         image_abs_path = os.path.normpath(os.path.join(self.csv_path, image_rel_path))
-        image = cv2.imread(image_abs_path)
+        try:
+            # Use numpy to read file (supports Unicode paths on Windows)
+            image_stream = np.fromfile(image_abs_path, dtype=np.uint8)
+            image = cv2.imdecode(image_stream, cv2.IMREAD_COLOR)
+        except:
+            image = None
         
         if image is None:
             print(f"Warning: Unable to load image {image_abs_path}")
@@ -124,7 +128,7 @@ class Model:
         
         # Define data preprocessing transforms (no augmentation for inference)
         self.transforms = A.Compose([
-            A.Resize(256, 256),
+            A.Resize(224, 224),  # Swin-Base expects 224x224 input
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2(),
         ])
@@ -185,7 +189,7 @@ class Model:
         # Create and load model
         print(f"\nLoading model...")
         self.model = MultiTaskModelFactory(
-            encoder_name='efficientnet-b4',
+            encoder_name='swin_b',
             encoder_weights=None,
             task_configs=self.task_configs
         ).to(self.device)
@@ -205,7 +209,7 @@ class Model:
             dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=0,  # Set to 0 for Windows to avoid multiprocessing issues
             pin_memory=True,
             collate_fn=inference_collate_fn
         )
@@ -298,7 +302,16 @@ class Model:
         print()
     
     def _save_segmentation(self, pred, image_path, mask_path, output_dir, original_size):
-        """Save segmentation prediction results as image file"""
+        """
+        Save segmentation prediction results as image file
+        
+        Args:
+            pred: Prediction result (C, H, W) or (H, W)
+            image_path: Image path
+            mask_path: Mask path (from CSV)
+            output_dir: Output root directory
+            original_size: Original image size (height, width)
+        """
         if isinstance(pred, torch.Tensor):
             pred = pred.cpu().numpy()
         
@@ -329,7 +342,17 @@ class Model:
         cv2.imwrite(output_path, mask)
     
     def _process_classification(self, pred, task_id, image_path):
-        """Process classification task prediction results"""
+        """
+        Process classification task prediction results
+        
+        Args:
+            pred: Prediction logits (num_classes,)
+            task_id: Task ID
+            image_path: Image path
+            
+        Returns:
+            Dictionary containing prediction results
+        """
         if isinstance(pred, torch.Tensor):
             pred = pred.cpu().numpy()
         
@@ -349,7 +372,18 @@ class Model:
         }
     
     def _process_regression(self, pred, task_id, image_path, original_size):
-        """Process regression task prediction results (keypoint localization)"""
+        """
+        Process regression task prediction results (keypoint localization)
+        
+        Args:
+            pred: Predicted coordinates (num_points * 2,) - normalized coordinates
+            task_id: Task ID
+            image_path: Image path
+            original_size: Original image size (height, width)
+            
+        Returns:
+            Dictionary containing prediction results
+        """
         if isinstance(pred, torch.Tensor):
             pred = pred.cpu().numpy()
         
@@ -361,8 +395,8 @@ class Model:
         pixel_coords = []
         for i in range(0, len(coords), 2):
             x_norm, y_norm = coords[i], coords[i+1]
-            x_pixel = x_norm * w
-            y_pixel = y_norm * h
+            x_pixel = float(x_norm * w)
+            y_pixel = float(y_norm * h)
             pixel_coords.extend([x_pixel, y_pixel])
         
         return {
@@ -373,7 +407,19 @@ class Model:
         }
     
     def _process_detection(self, pred, task_id, image_path, original_size):
-        """Process detection task prediction results"""
+        """
+        Process detection task prediction results
+        
+        Args:
+            pred: Prediction result (5, H, W) - grid-based predictions
+                  First 4 channels are bbox coordinates, 5th channel is confidence score
+            task_id: Task ID
+            image_path: Image path
+            original_size: Original image size (height, width)
+            
+        Returns:
+            Dictionary containing prediction results
+        """
         if isinstance(pred, torch.Tensor):
             pred = pred.cpu().numpy()
         
@@ -392,10 +438,10 @@ class Model:
         # Convert to pixel coordinates
         img_h, img_w = original_size
         bbox_pixel = [
-            bbox_norm[0] * img_w,
-            bbox_norm[1] * img_h,
-            bbox_norm[2] * img_w,
-            bbox_norm[3] * img_h
+            float(bbox_norm[0] * img_w),
+            float(bbox_norm[1] * img_h),
+            float(bbox_norm[2] * img_w),
+            float(bbox_norm[3] * img_h)
         ]
         
         return {
@@ -406,28 +452,33 @@ class Model:
         }
 
 
-# Docker entry point
 if __name__ == '__main__':
     """
-    Docker environment entry point
+    Usage example
     """
-    # Docker path configuration
-    tmp_dir = '/myhome/'
-    os.makedirs(tmp_dir, exist_ok=True)
+    # Set paths
+    data_root = '/input'
+    output_dir = '/output'
+    batch_size = 8
     
-    data_root = '/input/'      # Docker mounted input data directory
-    output_dir = '/output/'    # Docker mounted output directory
-    
-    print('='*60)
-    print('Foundation Model Challenge for Ultrasound Image Analysis (FMC_UIA) - Docker Inference')
-    print('='*60)
-    
-    start_time = time.time()
+    # Data directory structure:
+    # data_root/
+    # ├── csv_files/
+    # │   ├── task1.csv
+    # │   ├── task2.csv
+    # │   └── ...
+    # └── (other data files)
+    #
+    # CSV file format includes the following columns:
+    # - image_path: Image relative path
+    # - task_id: Task ID
+    # - task_name: Task type (segmentation/classification/Regression/detection)
+    # - num_classes: Number of classes
+    # - mask_path: (Segmentation task) mask output path
     
     # Create model and perform prediction
     model = Model()
-    model.predict(data_root, output_dir, batch_size=8)
+    model.predict(data_root, output_dir, batch_size=batch_size)
     
-    elapsed_time = time.time() - start_time
-    print(f"\nTotal time: {elapsed_time:.2f} seconds")
     print("Inference complete!")
+

@@ -28,7 +28,7 @@ ENCODER = 'swin_b'  # Swin-Base for better performance on complex multi-task lea
 ENCODER_WEIGHTS = 'imagenet'
 RANDOM_SEED = 42
 MODEL_SAVE_PATH = 'best_model.pth' 
-VAL_SPLIT = 0.2
+VAL_SPLIT = 0.0  # Disabled: using external validation set provided by competition
 PRINT_FREQ = 50  # Print training status every N batches (set to 0 to disable batch-level printing)
 
 def main():
@@ -39,7 +39,7 @@ def main():
     # Data loading and splitting
     # Training transforms with augmentation
     train_transforms = A.Compose([
-        A.Resize(256, 256), 
+        A.Resize(224, 224),  # Swin-Base expects 224x224 input
         A.RandomBrightnessContrast(p=0.2),
         A.GaussNoise(p=0.1), 
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
@@ -48,48 +48,21 @@ def main():
     
     # Validation transforms without augmentation
     val_transforms = A.Compose([
-        A.Resize(256, 256),
+        A.Resize(224, 224),  # Swin-Base expects 224x224 input
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2(),
     ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['class_labels'], clip=True, min_visibility=0.1))
 
-    # Create full dataset to get indices
-    temp_dataset = MultiTaskDataset(data_root=DATA_ROOT_PATH, transforms=train_transforms)
-    dataset_size = len(temp_dataset)
-    val_size = int(dataset_size * VAL_SPLIT)
-    train_size = dataset_size - val_size
-    
-    # Split indices
-    generator = torch.Generator().manual_seed(RANDOM_SEED)
-    indices = list(range(dataset_size))
-    train_indices, val_indices = torch.utils.data.random_split(indices, [train_size, val_size], generator=generator)
-    
-    # Create separate datasets with different transforms
+    # Create full dataset for training (no validation split)
     train_dataset = MultiTaskDataset(data_root=DATA_ROOT_PATH, transforms=train_transforms)
-    val_dataset = MultiTaskDataset(data_root=DATA_ROOT_PATH, transforms=val_transforms)
+    dataset_size = len(train_dataset)
     
-    # Create subsets
-    train_subset = torch.utils.data.Subset(train_dataset, train_indices.indices)
-    val_subset = torch.utils.data.Subset(val_dataset, val_indices.indices)
+    print(f"Dataset: {dataset_size} training samples (using all data, validation provided separately)")
     
-    print(f"Dataset split: {train_size} training samples, {val_size} validation samples")
-    
-    # Fix dataframe reference for subset
-    train_subset.dataframe = train_dataset.dataframe.iloc[train_indices.indices].reset_index(drop=True)
-    
-    train_sampler = MultiTaskUniformSampler(train_subset, batch_size=BATCH_SIZE)
+    train_sampler = MultiTaskUniformSampler(train_dataset, batch_size=BATCH_SIZE)
     train_loader = torch.utils.data.DataLoader(
-        train_subset, 
+        train_dataset, 
         batch_sampler=train_sampler, 
-        num_workers=0,  # Set to 0 for Windows to avoid multiprocessing issues
-        pin_memory=True,
-        collate_fn=multi_task_collate_fn
-    )
-    
-    val_loader = torch.utils.data.DataLoader(
-        val_subset, 
-        batch_size=8,
-        shuffle=False, 
         num_workers=0,  # Set to 0 for Windows to avoid multiprocessing issues
         pin_memory=True,
         collate_fn=multi_task_collate_fn
@@ -125,7 +98,6 @@ def main():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
     print("\n--- Cosine Annealing Scheduler configured ---")
 
-    best_val_score = -float('inf')
     print("\n" + "="*50 + "\n--- Start Training ---")
     
     for epoch in range(NUM_EPOCHS):
@@ -187,28 +159,14 @@ def main():
             print(f"  - Task '{task_id:<25}': {avg_loss:.4f}")
         print("-" * 40)
 
-        # Validation
-        val_results_df = evaluate(model, val_loader, device)
-        
-        score_cols = [col for col in val_results_df.columns if 'MAE' not in col and isinstance(val_results_df[col].iloc[0], (int, float))]
-        avg_val_score = 0
-        if not val_results_df.empty and score_cols:
-            avg_val_score = val_results_df[score_cols].mean().mean()
-
-        print("\n--- Epoch {} Validation Report ---".format(epoch + 1))
-        if not val_results_df.empty:
-            print(val_results_df.to_string(index=False))
-        print(f"--- Average Val Score (Higher is better): {avg_val_score:.4f} ---")
-
-        if avg_val_score > best_val_score:
-            best_val_score = avg_val_score
-            torch.save(model.state_dict(), MODEL_SAVE_PATH)
-            print(f"-> New best model saved! Score improved to: {best_val_score:.4f}\n")
+        # Save model checkpoint each epoch
+        torch.save(model.state_dict(), MODEL_SAVE_PATH)
+        print(f"-> Model checkpoint saved to: {MODEL_SAVE_PATH}\n")
         
         # Update scheduler
         scheduler.step()
 
-    print(f"\n--- Training Finished ---\nBest model saved at: {MODEL_SAVE_PATH}")
+    print(f"\n--- Training Finished ---\nFinal model saved at: {MODEL_SAVE_PATH}")
 
 if __name__ == '__main__':
     main()

@@ -405,7 +405,7 @@ if __name__ == '__main__':
     使用示例
     """
     # 配置路径
-    data_root = r'f:\ultrasound\Foundation-Model-Challenge-for-Ultrasound-Image-Analysis\data\train'  # 数据根目录
+    data_root = '/proj/uppmax2025-2-369/Cgrain/ult/data/train'  # 数据根目录
     pred_root = 'predictions_new_new/'  # 预测结果目录
     output_dir = 'visualizations/'      # 可视化输出目录
     

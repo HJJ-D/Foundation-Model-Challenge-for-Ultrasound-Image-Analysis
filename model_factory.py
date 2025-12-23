@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import segmentation_models_pytorch as smp
 from typing import List, Dict
+import timm
 
 # Task configuration list
 TASK_CONFIGURATIONS = [
@@ -33,6 +34,47 @@ TASK_CONFIGURATIONS = [
     {'task_name': 'segmentation', 'num_classes': 2, 'task_id': 'ovary_tumor'},
     {'task_name': 'segmentation', 'num_classes': 2, 'task_id': 'thyroid_nodule'},
 ]
+
+# ====================================================================
+# --- Custom Swin Transformer Encoder ---
+# ====================================================================
+
+# Mapping of simplified names to full timm model names
+SWIN_MODEL_MAPPING = {
+    'swin_t': 'swin_tiny_patch4_window7_224',
+    'swin_s': 'swin_small_patch4_window7_224',
+    'swin_b': 'swin_base_patch4_window7_224',
+    'swin_l': 'swin_large_patch4_window7_224',
+    'swin_large_patch4_window12_384': 'swin_large_patch4_window12_384',  # Full name passthrough
+}
+
+class SwinTransformerEncoder(nn.Module):
+    """Swin Transformer encoder wrapper compatible with segmentation_models_pytorch."""
+    def __init__(self, model_name: str = 'swin_b', pretrained: bool = True):
+        super().__init__()
+        # Map simplified name to full timm model name
+        full_model_name = SWIN_MODEL_MAPPING.get(model_name, model_name)
+        
+        self.model = timm.create_model(
+            full_model_name,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(0, 1, 2, 3)  # Swin has 4 stages
+        )
+        self._out_channels = self.model.feature_info.channels()
+        self.output_stride = 32
+        
+    def forward(self, x):
+        features = self.model(x)
+        # Swin outputs features in (B, H, W, C) format, need to convert to (B, C, H, W)
+        features = [feat.permute(0, 3, 1, 2).contiguous() for feat in features]
+        return features
+    
+    @property
+    def out_channels(self):
+        # FPN expects encoder_channels in format: [input_channels, stage0, stage1, stage2, stage3]
+        # For Swin with 4 stages: [3, 128, 256, 512, 1024]
+        return [3] + list(self._out_channels)
 
 # Task specific heads
 
@@ -102,21 +144,41 @@ class MultiTaskModelFactory(nn.Module):
         
         # Initialize shared encoder
         print(f"Initializing shared encoder: {encoder_name}")
-        self.encoder = smp.encoders.get_encoder(
-            name=encoder_name,
-            in_channels=3,
-            depth=5,
-            weights=encoder_weights,
-        )
         
-        # Initialize shared FPN decoder
-        temp_fpn_model = smp.FPN(
-            encoder_name=encoder_name,
-            encoder_weights=encoder_weights,
-            in_channels=3,
-            classes=1, 
-        )
-        self.fpn_decoder = temp_fpn_model.decoder
+        if encoder_name.startswith('swin_'):
+            # Use custom Swin encoder
+            pretrained = (encoder_weights == 'imagenet' or encoder_weights is not None)
+            self.encoder = SwinTransformerEncoder(model_name=encoder_name, pretrained=pretrained)
+            print(f"Using custom Swin Transformer: {encoder_name}")
+            
+            # Create FPN decoder for Swin
+            from segmentation_models_pytorch.decoders.fpn.decoder import FPNDecoder
+            encoder_channels = self.encoder.out_channels
+            self.fpn_decoder = FPNDecoder(
+                encoder_channels=encoder_channels,
+                encoder_depth=5,  # 5 = input + 4 stages
+                pyramid_channels=256,
+                segmentation_channels=128,
+                dropout=0.2,
+                merge_policy="cat"
+            )
+        else:
+            # Use standard smp encoder
+            self.encoder = smp.encoders.get_encoder(
+                name=encoder_name,
+                in_channels=3,
+                depth=5,
+                weights=encoder_weights,
+            )
+            
+            # Initialize shared FPN decoder
+            temp_fpn_model = smp.FPN(
+                encoder_name=encoder_name,
+                encoder_weights=encoder_weights,
+                in_channels=3,
+                classes=1, 
+            )
+            self.fpn_decoder = temp_fpn_model.decoder
         
         # Initialize task heads
         self.heads = nn.ModuleDict()
@@ -184,13 +246,13 @@ class MultiTaskModelFactory(nn.Module):
 
 if __name__ == '__main__':
     model = MultiTaskModelFactory(
-        encoder_name='resnet34',
+        encoder_name='swin_b',
         encoder_weights='imagenet',
         task_configs=TASK_CONFIGURATIONS
     )
 
     print("\n--- Forward Pass Test ---")
-    dummy_image_batch = torch.randn(2, 3, 256, 256) # Reduced batch size for test
+    dummy_image_batch = torch.randn(2, 3, 224, 224)  # Swin-Base expects 224x224
 
     # Test specific tasks
     test_tasks = ['cardiac_multi', 'fetal_plane_cls', 'FUGC', 'thyroid_nodule_det']
