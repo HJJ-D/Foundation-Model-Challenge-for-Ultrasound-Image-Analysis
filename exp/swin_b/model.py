@@ -189,7 +189,7 @@ class Model:
         # Create and load model
         print(f"\nLoading model...")
         self.model = MultiTaskModelFactory(
-            encoder_name='swin_l',
+            encoder_name='swin_b',
             encoder_weights=None,
             task_configs=self.task_configs
         ).to(self.device)

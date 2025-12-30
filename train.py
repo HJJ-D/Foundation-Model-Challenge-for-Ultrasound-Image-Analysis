@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 from collections import defaultdict
@@ -24,12 +25,23 @@ LEARNING_RATE = 1e-4
 BATCH_SIZE = 4  # Reduced for Swin-B due to higher memory requirements
 NUM_EPOCHS = 50 
 DATA_ROOT_PATH = '/proj/uppmax2025-2-369/Cgrain/ult/data/train'
-ENCODER = 'swin_b'  # Swin-Base for better performance on complex multi-task learning
+ENCODER = 'swin_l'  # Swin-Base for better performance on complex multi-task learning
 ENCODER_WEIGHTS = 'imagenet'
+IMG_SIZE = 224  # Input image size (224 to match Swin ImageNet pretrained weights)
 RANDOM_SEED = 42
 MODEL_SAVE_PATH = 'best_model.pth' 
 VAL_SPLIT = 0.2
 PRINT_FREQ = 50  # Print training status every N batches (set to 0 to disable batch-level printing)
+
+# Deep Supervision configuration
+USE_DEEP_SUPERVISION = True  # Enable deep supervision for segmentation tasks
+NUM_AUX_OUTPUTS = 3  # Number of auxiliary outputs
+AUX_LOSS_WEIGHTS = [0.5, 0.3, 0.2]  # Weights for auxiliary losses (should sum to ~1.0)
+
+# Detection-specific configurations
+USE_SEPARATE_DETECTION_FPN = True  # Use independent FPN decoder for detection
+DETECTION_CLS_WEIGHT = 2.0  # Classification loss weight (increased)
+DETECTION_BOX_WEIGHT = 1.0  # Bbox regression loss weight
 
 def main():
     set_seed(RANDOM_SEED)
@@ -39,7 +51,7 @@ def main():
     # Data loading and splitting
     # Training transforms with augmentation
     train_transforms = A.Compose([
-        A.Resize(256, 256), 
+        A.Resize(224, 224),  # Match Swin pretrained size
         A.RandomBrightnessContrast(p=0.2),
         A.GaussNoise(p=0.1), 
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
@@ -48,7 +60,7 @@ def main():
     
     # Validation transforms without augmentation
     val_transforms = A.Compose([
-        A.Resize(256, 256),
+        A.Resize(224, 224),  # Match Swin pretrained size
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2(),
     ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['class_labels'], clip=True, min_visibility=0.1))
@@ -96,13 +108,24 @@ def main():
     )
     
     # Model and loss setup
-    model = MultiTaskModelFactory(encoder_name=ENCODER, encoder_weights=ENCODER_WEIGHTS, task_configs=TASK_CONFIGURATIONS).to(device)
+    model = MultiTaskModelFactory(
+        encoder_name=ENCODER, 
+        encoder_weights=ENCODER_WEIGHTS, 
+        task_configs=TASK_CONFIGURATIONS,
+        use_deep_supervision=USE_DEEP_SUPERVISION,
+        num_aux_outputs=NUM_AUX_OUTPUTS,
+        use_separate_detection_fpn=USE_SEPARATE_DETECTION_FPN,
+        img_size=IMG_SIZE  # Pass image size to avoid Swin mismatch
+    ).to(device)
     
     loss_functions = {
         'segmentation': smp_losses.DiceLoss(mode='multiclass'), 
         'classification': nn.CrossEntropyLoss(),
         'Regression': nn.MSELoss(), 
-        'detection': DetectionLoss()
+        'detection': DetectionLoss(
+            classification_weight=DETECTION_CLS_WEIGHT,
+            box_regression_weight=DETECTION_BOX_WEIGHT
+        )
     }
     task_id_to_name = {cfg['task_id']: cfg['task_name'] for cfg in TASK_CONFIGURATIONS}
 
@@ -148,26 +171,50 @@ def main():
 
             outputs = model(images, task_id=current_task_id)
             
-            # Grid-based detection logic
-            if task_name == 'detection':
-                _, _, h, w = outputs.shape
+            # Handle deep supervision outputs for segmentation tasks
+            if task_name == 'segmentation' and USE_DEEP_SUPERVISION:
+                main_out, aux_outs = outputs
                 
-                # Calculate center of GT box (normalized)
-                gt_center_x = (labels[:, 0] + labels[:, 2]) / 2.0
-                gt_center_y = (labels[:, 1] + labels[:, 3]) / 2.0
-
-                # Map to grid coordinates
-                coord_h = torch.clamp((gt_center_y * h).long(), 0, h - 1)
-                coord_w = torch.clamp((gt_center_x * w).long(), 0, w - 1)
-
-                # Extract prediction from the specific grid cell
-                final_outputs = torch.zeros((images.shape[0], 5), device=device)
-                for i in range(images.shape[0]):
-                    final_outputs[i] = outputs[i, :, coord_h[i], coord_w[i]]
+                # Compute main loss
+                loss = loss_functions[task_name](main_out, labels)
+                
+                # Compute auxiliary losses
+                aux_loss = 0.0
+                target_size = labels.shape[-2:]  # Get H, W from labels
+                for i, aux_out in enumerate(aux_outs):
+                    # Upsample auxiliary output to match label size
+                    aux_out_upsampled = F.interpolate(aux_out, size=target_size, mode='bilinear', align_corners=False)
+                    aux_loss_i = loss_functions[task_name](aux_out_upsampled, labels)
+                    aux_loss += AUX_LOSS_WEIGHTS[i] * aux_loss_i
+                
+                # Total loss = main loss + weighted auxiliary losses
+                loss = loss + aux_loss
             else:
-                final_outputs = outputs
-            
-            loss = loss_functions[task_name](final_outputs, labels)
+                # For non-segmentation tasks or when deep supervision is disabled
+                if task_name == 'detection':
+                    # Single grid training (stable and proven to work)
+                    B, C, H, W = outputs.shape  # [B, 5, H, W]
+                    
+                    # Extract prediction at GT center grid
+                    gt_center_x = (labels[:, 0] + labels[:, 2]) / 2.0
+                    gt_center_y = (labels[:, 1] + labels[:, 3]) / 2.0
+                    coord_h = torch.clamp((gt_center_y * H).long(), 0, H - 1)
+                    coord_w = torch.clamp((gt_center_x * W).long(), 0, W - 1)
+                    
+                    # Extract predictions at center positions
+                    final_outputs = torch.zeros((B, 5), device=device)
+                    for i in range(B):
+                        final_outputs[i] = outputs[i, :, coord_h[i], coord_w[i]]
+                    
+                    # Create target: [bbox(4), objectness(1)] to match model output format
+                    targets = torch.cat([
+                        labels,  # [B, 4] bbox coordinates (already in [0,1])
+                        torch.ones((B, 1), device=device)  # objectness=1 for all samples
+                    ], dim=1)  # [B, 5]
+                    
+                    loss = loss_functions[task_name](final_outputs, targets)
+                else:
+                    loss = loss_functions[task_name](outputs, labels)
             
             optimizer.zero_grad()
             loss.backward()

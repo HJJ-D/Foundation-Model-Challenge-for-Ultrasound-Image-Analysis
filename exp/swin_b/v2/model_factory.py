@@ -50,7 +50,7 @@ SWIN_MODEL_MAPPING = {
 
 class SwinTransformerEncoder(nn.Module):
     """Swin Transformer encoder wrapper compatible with segmentation_models_pytorch."""
-    def __init__(self, model_name: str = 'swin_l', pretrained: bool = True, img_size: int = 256):
+    def __init__(self, model_name: str = 'swin_b', pretrained: bool = True, img_size: int = 256):
         super().__init__()
         # Map simplified name to full timm model name
         full_model_name = SWIN_MODEL_MAPPING.get(model_name, model_name)
@@ -178,19 +178,13 @@ class DeepSupervisionSegHead(nn.Module):
 class MultiTaskModelFactory(nn.Module):
     def __init__(self, encoder_name: str, encoder_weights: str, task_configs: List[Dict],
                  use_deep_supervision: bool = False, num_aux_outputs: int = 3,
-                 use_separate_detection_fpn: bool = True, img_size: int = 256):  # 新增img_size参数
+                 use_separate_detection_fpn: bool = True, img_size: int = 256): 
         super().__init__()
         
         self.use_deep_supervision = use_deep_supervision
         self.num_aux_outputs = num_aux_outputs
         self.use_separate_detection_fpn = use_separate_detection_fpn
         
-        # Initialize shared encoder
-        print(f"Initializing shared encoder: {encoder_name}")
-        if use_deep_supervision:
-            print(f"Deep Supervision enabled with {num_aux_outputs} auxiliary outputs")
-        if use_separate_detection_fpn:
-            print(f"Using separate FPN decoder for detection tasks")
         
         if encoder_name.startswith('swin_'):
             # Use custom Swin encoder with specified image size
@@ -200,7 +194,6 @@ class MultiTaskModelFactory(nn.Module):
                 pretrained=pretrained, 
                 img_size=img_size
             )
-            print(f"Using custom Swin Transformer: {encoder_name} with img_size={img_size}")
             
             # Create FPN decoder for Swin
             from segmentation_models_pytorch.decoders.fpn.decoder import FPNDecoder
@@ -332,7 +325,7 @@ class MultiTaskModelFactory(nn.Module):
 
 if __name__ == '__main__':
     model = MultiTaskModelFactory(
-        encoder_name='swin_l',
+        encoder_name='swin_b',
         encoder_weights='imagenet',
         task_configs=TASK_CONFIGURATIONS
     )

@@ -50,7 +50,7 @@ SWIN_MODEL_MAPPING = {
 
 class SwinTransformerEncoder(nn.Module):
     """Swin Transformer encoder wrapper compatible with segmentation_models_pytorch."""
-    def __init__(self, model_name: str = 'swin_l', pretrained: bool = True, img_size: int = 256):
+    def __init__(self, model_name: str = 'swin_b', pretrained: bool = True, img_size: int = 256):
         super().__init__()
         # Map simplified name to full timm model name
         full_model_name = SWIN_MODEL_MAPPING.get(model_name, model_name)
@@ -332,7 +332,7 @@ class MultiTaskModelFactory(nn.Module):
 
 if __name__ == '__main__':
     model = MultiTaskModelFactory(
-        encoder_name='swin_l',
+        encoder_name='swin_b',
         encoder_weights='imagenet',
         task_configs=TASK_CONFIGURATIONS
     )
