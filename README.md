@@ -468,5 +468,71 @@ Remember the key steps:
 
 **Passing the Codabench evaluation on the validation set ensures your final submission is correct!**
 
+---
+
+## 📊 Training Logs and Analysis (NEW!)
+
+### Automatic Training Logs
+
+The training script now automatically records all metrics for easy analysis and paper writing:
+
+- ✅ **Training losses** (per task, with mean/std/min/max)
+- ✅ **Validation metrics** (Accuracy, F1, Dice, IoU, MAE)
+- ✅ **Learning rate schedule**
+- ✅ **Training time per epoch**
+- ✅ **Automatic plotting** of training curves
+- ✅ **Timestamp labeled** for each experiment
+
+### Quick Usage
+
+**Train (logs saved automatically):**
+```bash
+python code/train.py --config code/configs/config.yaml
+```
+
+**Quick analysis:**
+```bash
+python quick_example.py outputs/experiment_20260101_123456
+```
+
+**Generate all plots:**
+```bash
+python code/utils/plot_training.py outputs/experiment_20260101_123456
+```
+
+### Output Files
+
+```
+outputs/experiment_20260101_123456/
+├── training_summary.csv       # ⭐ Best for plotting
+├── train_losses.csv           # Detailed training losses
+├── val_metrics.csv            # Detailed validation metrics
+├── training_history.json      # Complete history
+├── best_model.pth             # Best model weights
+└── training_curves.png        # Auto-generated plots
+```
+
+### Documentation
+
+- **[QUICKSTART_LOGS.md](QUICKSTART_LOGS.md)** - Quick start guide (2 min read)
+- **[TRAINING_LOGS_GUIDE.md](TRAINING_LOGS_GUIDE.md)** - Complete guide with examples
+- **[LOGS_OUTPUT_EXAMPLE.md](LOGS_OUTPUT_EXAMPLE.md)** - Output format examples
+- **[SUMMARY.md](SUMMARY.md)** - Summary of all changes
+
+### Example: Plot Accuracy
+
+```python
+import pandas as pd
+import matplotlib.pyplot as plt
+
+df = pd.read_csv('outputs/experiment/training_summary.csv')
+plt.plot(df['epoch'], df['avg_accuracy'], marker='o')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.savefig('accuracy.png', dpi=300)  # High-res for papers
+```
+
+---
+
 Good luck! 🚀
 
