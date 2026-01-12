@@ -107,6 +107,13 @@ training:
     detection: 1.0
     regression: 1.0
   
+  # Adaptive loss weighting (uncertainty-based)
+  adaptive_loss:
+    enabled: false  # Set to true to enable adaptive loss weighting
+    init_log_vars: -1.0
+    learning_rate: 1.0e-4
+    warmup_epochs: 3
+  
   # Task-specific loss settings
   loss_configs:
     segmentation:

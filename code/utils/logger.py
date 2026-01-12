@@ -57,7 +57,7 @@ class TrainingLogger:
         print(f"Timestamp: {self.timestamp}")
         print(f"{'='*80}\n")
     
-    def log_epoch(self, epoch, train_losses, val_results_df, learning_rate, epoch_time=None):
+    def log_epoch(self, epoch, train_losses, val_results_df, learning_rate, epoch_time=None, adaptive_weights=None):
         """
         Log metrics for one epoch.
         
@@ -67,6 +67,7 @@ class TrainingLogger:
             val_results_df: DataFrame with validation results
             learning_rate: Current learning rate
             epoch_time: Time taken for this epoch (in seconds)
+            adaptive_weights: Optional dict with adaptive loss weights and sigmas
         """
         epoch_data = {
             'epoch': epoch,
@@ -76,6 +77,10 @@ class TrainingLogger:
             'train_losses': {},
             'val_metrics': {}
         }
+        
+        # Add adaptive weights if provided
+        if adaptive_weights is not None:
+            epoch_data['adaptive_weights'] = adaptive_weights
         
         # Process training losses
         for task_id, losses in train_losses.items():

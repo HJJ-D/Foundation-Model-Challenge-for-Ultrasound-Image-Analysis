@@ -113,8 +113,8 @@ def build_dataloaders(config):
     return train_loader, val_loader
 
 
-def build_optimizer(model, config):
-    """Build optimizer with optional grouped learning rates."""
+def build_optimizer(model, config, loss_weighter=None):
+    """Build optimizer with optional grouped learning rates and adaptive loss parameters."""
     use_grouped_lr = config.get('training.optimizer.use_grouped_lr', True)
     lr = config.learning_rate
     weight_decay = config.weight_decay
@@ -131,6 +131,16 @@ def build_optimizer(model, config):
         print(f"✓ Using grouped LR: encoder={lr * encoder_lr_mult:.2e}, heads={lr * head_lr_mult:.2e}")
     else:
         param_groups = model.parameters()
+    
+    # Add adaptive loss parameters if using adaptive weighting
+    from losses.loss_functions import AdaptiveLossWeighter
+    if isinstance(loss_weighter, AdaptiveLossWeighter):
+        adaptive_lr = config.get('training.adaptive_loss.learning_rate', lr)
+        param_groups.append({
+            'params': loss_weighter.parameters(),
+            'lr': adaptive_lr
+        })
+        print(f"✓ Added adaptive loss parameters (lr={adaptive_lr:.2e})")
     
     optimizer_type = config.get('training.optimizer.type', 'AdamW')
     
@@ -183,14 +193,29 @@ def build_scheduler(optimizer, config):
     return scheduler
 
 
-def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, device, config):
+def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, device, config, current_epoch=0):
     """Train for one epoch."""
     model.train()
     epoch_losses = defaultdict(list)
+    epoch_task_weights = defaultdict(list)  # Track adaptive weights
     
     task_id_to_name = {cfg['task_id']: cfg['task_name'] for cfg in config.get_task_configs()}
     use_deep_supervision = config.get('model.heads.segmentation.use_deep_supervision', False)
     aux_loss_weights = config.get('model.heads.segmentation.aux_loss_weights', [0.5, 0.3, 0.2])
+    
+    # Check if using adaptive loss
+    from losses.loss_functions import AdaptiveLossWeighter
+    use_adaptive_loss = isinstance(loss_weights, AdaptiveLossWeighter)
+    if use_adaptive_loss:
+        loss_weights.train()  # Ensure it's in training mode
+        
+        # Warmup: freeze adaptive weights for first N epochs
+        warmup_epochs = config.get('training.adaptive_loss.warmup_epochs', 0)
+        freeze_adaptive = current_epoch < warmup_epochs
+        if freeze_adaptive and current_epoch == 0:
+            print(f"  [Adaptive Loss Warmup] Freezing adaptive weights for first {warmup_epochs} epochs")
+        elif not freeze_adaptive and current_epoch == warmup_epochs:
+            print(f"  [Adaptive Loss Warmup] Unfreezing adaptive weights from epoch {current_epoch+1}")
     
     print_freq = config.get('training.print_freq', 50)
     
@@ -256,28 +281,50 @@ def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, de
         else:
             loss = loss_functions[task_name](outputs, labels)
         
-        # Apply task weight
-        task_weight = loss_weights.get(task_name, 1.0)
-        loss = loss * task_weight
+        # Apply task weight (adaptive or fixed)
+        if use_adaptive_loss:
+            # Use adaptive weighting
+            losses_dict = {task_name: loss}
+            total_loss, weighted_losses, task_weights = loss_weights(losses_dict)
+            epoch_task_weights[task_name].append(task_weights[task_name])
+        else:
+            # Use fixed weight
+            task_weight = loss_weights.get(task_name, 1.0)
+            total_loss = loss * task_weight
         
         # Backward pass
         optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         
         # Gradient clipping
         if config.get('training.gradient_clip', 0) > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.get('training.gradient_clip'))
         
+        # During warmup, don't update adaptive loss parameters
+        if use_adaptive_loss and freeze_adaptive:
+            # Zero out gradients for adaptive loss parameters
+            for param in loss_weights.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+        
         optimizer.step()
         
-        epoch_losses[current_task_id].append(loss.item())
+        epoch_losses[current_task_id].append(total_loss.item())
         
         # Print progress
         if print_freq > 0 and (batch_idx + 1) % print_freq == 0:
             avg_loss = np.mean(epoch_losses[current_task_id])
-            print(f"  Batch [{batch_idx+1}/{len(train_loader)}] | Task: {current_task_id} | Loss: {avg_loss:.4f}")
+            if use_adaptive_loss and task_name in epoch_task_weights and len(epoch_task_weights[task_name]) > 0:
+                avg_weight = np.mean(epoch_task_weights[task_name])
+                print(f"  Batch [{batch_idx+1}/{len(train_loader)}] | Task: {current_task_id} | Loss: {avg_loss:.4f} | Weight: {avg_weight:.4f}")
+            else:
+                print(f"  Batch [{batch_idx+1}/{len(train_loader)}] | Task: {current_task_id} | Loss: {avg_loss:.4f}")
     
-    return epoch_losses
+    # Return both losses and weights
+    if use_adaptive_loss:
+        return epoch_losses, epoch_task_weights
+    else:
+        return epoch_losses
 
 
 def main(config_path=None):
@@ -313,8 +360,8 @@ def main(config_path=None):
     # Build losses
     loss_functions, loss_weights = build_all_losses(config)
     
-    # Build optimizer and scheduler
-    optimizer = build_optimizer(model, config)
+    # Build optimizer and scheduler (pass loss_weights for adaptive loss support)
+    optimizer = build_optimizer(model, config, loss_weighter=loss_weights)
     scheduler = build_scheduler(optimizer, config)
     
     print(f"\n{'='*80}")
@@ -334,10 +381,18 @@ def main(config_path=None):
         print("-" * 80)
         
         # Train
-        epoch_losses = train_epoch(
+        train_result = train_epoch(
             model, train_loader, loss_functions, loss_weights,
-            optimizer, config.device, config
+            optimizer, config.device, config, current_epoch=epoch
         )
+        
+        # Handle return value (might include weights for adaptive loss)
+        from losses.loss_functions import AdaptiveLossWeighter
+        if isinstance(loss_weights, AdaptiveLossWeighter):
+            epoch_losses, epoch_task_weights = train_result
+        else:
+            epoch_losses = train_result
+            epoch_task_weights = None
         
         epoch_train_time = time.time() - epoch_start_time
         
@@ -346,6 +401,15 @@ def main(config_path=None):
         for task_id, losses in sorted(epoch_losses.items()):
             avg_loss = np.mean(losses)
             print(f"  {task_id:<30}: {avg_loss:.4f}")
+        
+        # Print adaptive loss weights and uncertainties if using adaptive loss
+        from losses.loss_functions import AdaptiveLossWeighter
+        if isinstance(loss_weights, AdaptiveLossWeighter):
+            print(f"\nAdaptive Loss Weights and Uncertainties:")
+            task_weights = loss_weights.get_task_weights()
+            sigmas = loss_weights.get_sigmas()
+            for task_name in sorted(task_weights.keys()):
+                print(f"  {task_name:<20}: weight={task_weights[task_name]:.4f}, sigma={sigmas[task_name]:.4f}")
         
         # Validation
         print(f"\nRunning validation...")
@@ -369,12 +433,23 @@ def main(config_path=None):
         
         # Log epoch metrics
         epoch_total_time = time.time() - epoch_start_time
+        
+        # Prepare adaptive weights for logging
+        adaptive_weights = None
+        from losses.loss_functions import AdaptiveLossWeighter
+        if isinstance(loss_weights, AdaptiveLossWeighter):
+            adaptive_weights = {
+                'weights': loss_weights.get_task_weights(),
+                'sigmas': loss_weights.get_sigmas()
+            }
+        
         logger.log_epoch(
             epoch=epoch + 1,
             train_losses=epoch_losses,
             val_results_df=val_results_df,
             learning_rate=current_lr,
-            epoch_time=epoch_total_time
+            epoch_time=epoch_total_time,
+            adaptive_weights=adaptive_weights
         )
         
         # Save best model
@@ -401,13 +476,20 @@ def main(config_path=None):
         if config.get('experiment.save_checkpoints', True):
             if (epoch + 1) % config.get('experiment.checkpoint_freq', 5) == 0:
                 checkpoint_path = logger.get_experiment_dir() / f"checkpoint_epoch_{epoch+1}.pth"
-                torch.save({
+                checkpoint = {
                     'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'config': config.config,
                     'best_val_score': best_val_score
-                }, checkpoint_path)
+                }
+                
+                # Save adaptive loss parameters if using adaptive loss
+                from losses.loss_functions import AdaptiveLossWeighter
+                if isinstance(loss_weights, AdaptiveLossWeighter):
+                    checkpoint['adaptive_loss_state_dict'] = loss_weights.state_dict()
+                
+                torch.save(checkpoint, checkpoint_path)
                 print(f"✓ Saved checkpoint: {checkpoint_path}")
     
     # Save final summary

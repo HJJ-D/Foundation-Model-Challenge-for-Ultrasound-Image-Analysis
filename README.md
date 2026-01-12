@@ -1,17 +1,20 @@
-# Foundation Model Challenge for Ultrasound Image Analysis (FMC_UIA) - Baseline Code
+# Foundation Model Challenge for Ultrasound Image Analysis (FMC_UIA)
 
-Welcome to the Foundation Model Challenge for Ultrasound Image Analysis (FMC_UIA)! This repository provides baseline code to help you quickly get started with training, inference, and submission.
+🏥 Multi-Task Learning Framework for Medical Ultrasound Image Analysis
+
+This repository provides a **modular, configuration-driven training pipeline** for the Foundation Model Challenge for Ultrasound Image Analysis. The codebase has been refactored with clean architecture, supporting **27 tasks across 4 types**: segmentation, classification, detection, and regression.
 
 ## 📋 Table of Contents
 
 - [Competition Tasks](#-competition-tasks)
+- [Features](#-features)
 - [Quick Start](#-quick-start)
-- [Code Structure](#-code-structure)
-- [Training Model](#-training-model)
-- [Local Inference](#-local-inference)
-- [Docker Build and Test](#-docker-build-and-test)
-- [Important Notes](#-important-notes)
-- [FAQ](#-faq)
+- [Project Structure](#-project-structure)
+- [Configuration](#-configuration)
+- [Training](#-training)
+- [Inference](#-inference)
+- [Docker Deployment](#-docker-deployment)
+- [Advanced Usage](#-advanced-usage)
 
 ---
 
@@ -21,122 +24,252 @@ This challenge includes **4 types of medical image analysis tasks** with a total
 
 | Task Type | Count | Description | Output Format |
 |-----------|-------|-------------|---------------|
-| **Segmentation** | 12 | Pixel-level classification | Image |
-| **Classification** | 9 | Image classification | JSON file |
-| **Detection** | 3 | Object localization | JSON file |
-| **Regression** | 3 | Keypoint localization | JSON file |
+| **Segmentation** | 12 | Pixel-level tissue classification | Mask Images |
+| **Classification** | 9 | Image-level diagnosis | JSON |
+| **Detection** | 3 | Lesion/structure localization | JSON (Bounding Boxes) |
+| **Regression** | 3 | Anatomical keypoint localization | JSON (Coordinates) |
 
 ---
 
+## ✨ Features
+
+- 🧩 **Modular Architecture**: Clean separation of concerns with dedicated modules for data, models, losses, and utilities
+- ⚙️ **Configuration-Driven**: All hyperparameters managed via YAML configuration files
+- 🎨 **Flexible Model Design**: Support for multiple encoders (Swin Transformer, ResNet, etc.) and decoder architectures
+- 📊 **Advanced Training**: Multi-task learning with task-specific loss weighting and deep supervision
+- 🔍 **Comprehensive Logging**: Detailed training logs with metrics tracking and visualization
+- 🚀 **Production Ready**: Docker support for seamless deployment
+
+---
 
 ## 🚀 Quick Start
 
-### 1. Clone the Code
+### 1. Environment Setup
 
-### 2. Prepare Data
+```bash
+# Create virtual environment
+conda create -n ultrasound python=3.8
+conda activate ultrasound
 
-Data directory structure:
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### 2. Data Preparation
+
+Place your data in the following structure:
+
 ```
 data/
-├── train/
-│   ├── csv_files/              # CSV index files
-│   │   ├── task1.csv
-│   │   ├── task2.csv
-│   │   └── ...
-│   ├── Classification/         # Classification task images
-│   ├── Segmentation/          # Segmentation task images and masks
-│   │   ├── Two/               # 2-class segmentation
-│   │   ├── Three/             # 3-class segmentation
-│   │   ├── Four/              # 4-class segmentation
-│   │   └── Five/              # 5-class segmentation
-│   ├── Detection/             # Detection task images
-│   └── Regression/            # Regression task images
+└── train/
+    ├── csv_files/              # Task CSV index files
+    │   ├── task1.csv
+    │   ├── task2.csv
+    │   └── ...
+    ├── Classification/         # Classification images
+    ├── Segmentation/          # Segmentation images and masks
+    │   ├── Two/               # Binary segmentation
+    │   ├── Three/             # 3-class segmentation
+    │   ├── Four/              # 4-class segmentation
+    │   └── Five/              # 5-class segmentation
+    ├── Detection/             # Detection images
+    └── Regression/            # Regression images
+```
+
+### 3. Configure Training
+
+Edit `code/configs/config.yaml` to set your data path and hyperparameters:
+
+```yaml
+data:
+  root_path: "/path/to/your/data/train"
+  batch_size: 4
+  image_size: 224
+
+model:
+  encoder:
+    name: "swin_b"
+    pretrained: "imagenet"
+```
+
+### 4. Train Model
+
+```bash
+cd code
+python train.py
+```
+
+### 5. Monitor Training
+
+Training logs and checkpoints will be saved to `outputs/swin_b_multitask_baseline/`:
+- `training.log`: Detailed training logs
+- `best_model.pth`: Best performing model
+- `checkpoint_epoch_*.pth`: Periodic checkpoints
+
+---
+
+## 📁 Project Structure
+
+```
+Foundation-Model-Challenge-for-Ultrasound-Image-Analysis/
 │
-└── val/                       # Validation set (same structure as above)
-    ├── csv_files/
-    ├── Classification/
-    ├── Segmentation/
-    ├── Detection/
-    └── Regression/
-```
-
-### 3. Train Model
-
-```bash
-python train.py
-```
-
-Training will automatically:
-- Load data
-- Train multi-task model
-- Save best model as `best_model.pth`
-
-### 4. Local Inference
-
-```bash
-python model.py 
-```
-
----
-
-## 📁 Code Structure
-
-```
-baseline/
-├── train.py                    # Training script
-├── model.py                    # ⭐ Core: Inference model
-├── model_factory.py            # Multi-task model factory
-├── dataset.py                  # Dataset loader
-├── utils.py                    # Utility functions
-├── best_model.pth             # Trained model weights
-├── docker/                    # ⭐ Docker submission related
+├── code/                          # Main codebase (modular architecture)
+│   ├── configs/                   # Configuration management
+│   │   ├── __init__.py           # Config loader
+│   │   └── config.yaml           # Main configuration file
+│   │
+│   ├── data/                      # Data loading and processing
+│   │   ├── __init__.py
+│   │   └── dataset.py            # Multi-task dataset and samplers
+│   │
+│   ├── models/                    # Model architectures
+│   │   ├── __init__.py           # Model factory
+│   │   ├── encoders.py           # Feature extractors (Swin, ResNet, etc.)
+│   │   ├── decoders.py           # FPN and other decoders
+│   │   ├── heads.py              # Task-specific heads
+│   │   └── multitask_model.py    # Main multi-task model
+│   │
+│   ├── losses/                    # Loss functions
+│   │   ├── __init__.py           # Loss factory
+│   │   └── loss_functions.py     # Task-specific losses
+│   │
+│   ├── metrics/                   # Evaluation metrics
+│   │   └── __init__.py
+│   │
+│   ├── utils/                     # Utilities
+│   │   ├── __init__.py
+│   │   ├── common.py             # Common utilities
+│   │   ├── logger.py             # Training logger
+│   │   └── plot_training.py      # Visualization tools
+│   │
+│   └── train.py                   # Main training script
+│
+├── docker/                        # Docker deployment
 │   ├── Dockerfile
-│   ├── model.py              # Docker version of inference code
-│   ├── model_factory.py
 │   ├── requirements.txt
-│   ├── build.sh              # Build script
-│   ├── run_test.sh           # Test script
-│   ├── README.md             # Docker detailed documentation
-│   └── QUICKSTART.md         # Quick guide
-└── README.md                  # This file
+│   ├── model.py                  # Inference script
+│   ├── build.sh
+│   └── run_test.sh
+│
+├── data/                          # Data directory (not tracked)
+└── README.md                      # This file
 ```
 
 ---
 
-## 🎓 Training Model
+## ⚙️ Configuration
 
-### Training Script
+### Configuration File Structure
+
+The `code/configs/config.yaml` file controls all aspects of training:
+
+#### Data Configuration
+```yaml
+data:
+  root_path: "/path/to/data/train"
+  val_split: 0.2
+  batch_size: 4
+  image_size: 224
+```
+
+#### Model Architecture
+```yaml
+model:
+  encoder:
+    name: "swin_b"              # swin_t, swin_s, swin_b, resnet50, etc.
+    pretrained: "imagenet"
+    freeze_encoder: false
+  
+  decoder:
+    type: "fpn"
+    pyramid_channels: 256
+    separate_detection_fpn: true
+```
+
+#### Training Settings
+```yaml
+training:
+  num_epochs: 50
+  optimizer:
+    type: "AdamW"
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-4
+  
+  scheduler:
+    type: "CosineAnnealingLR"
+    T_max: 50
+```
+
+#### Loss Weights
+```yaml
+loss:
+  task_weights:
+    segmentation: 1.0
+    classification: 1.0
+    detection: 1.0
+    Regression: 1.0
+```
+
+For full configuration options, see [code/configs/config.yaml](code/configs/config.yaml).
+
+---
+
+## 🎓 Training
+
+### Basic Training
 
 ```bash
+cd code
 python train.py
 ```
 
-### Main Parameters (can be modified in train.py)
+### Command Line Arguments
 
-```python
-LEARNING_RATE = 1e-4
-BATCH_SIZE = 8
-NUM_EPOCHS = 50
-DATA_ROOT_PATH = '/path/to/train'
-MODEL_SAVE_PATH = 'best_model.pth'
+```bash
+# Use custom config file
+python train.py --config configs/custom_config.yaml
+
+# Override config parameters
+python train.py --data.batch_size 8 --training.num_epochs 100
+
+# Resume from checkpoint
+python train.py --resume outputs/swin_b_multitask_baseline/checkpoint_epoch_30.pth
 ```
 
 ### Training Output
 
-- **Model weights**: `best_model.pth`
-- **Training logs**: Terminal output
+During training, the following outputs are generated:
+
+- **Checkpoints**: `outputs/{experiment_name}/best_model.pth`
+- **Logs**: `outputs/{experiment_name}/training.log`
+- **Metrics**: Displayed in console and saved to log file
+
+Example training log:
+```
+Epoch 10/50
+Train Loss: 0.2456 | Seg: 0.1234 | Cls: 0.0456 | Det: 0.0567 | Reg: 0.0199
+Val Loss: 0.2123 | Seg: 0.1056 | Cls: 0.0398 | Det: 0.0489 | Reg: 0.0180
+✓ New best model saved!
+```
 
 ---
 
-## 🔮 Local Inference
+## 🔮 Inference
 
-###  Using model.py
+### Local Inference
 
-Modify the paths in `model.py`:
+```bash
+cd docker
+python model.py
+```
+
+### Modify Inference Paths
+
+Edit `docker/model.py`:
 
 ```python
 if __name__ == '__main__':
-    data_root = '/path/to/your/data'  # Change to your data path
+    data_root = '/path/to/test/data'
     output_dir = 'predictions/'
     batch_size = 8
     
@@ -144,228 +277,263 @@ if __name__ == '__main__':
     model.predict(data_root, output_dir, batch_size=batch_size)
 ```
 
-Then run:
-
-```bash
-python model.py
-```
-
-### Expected Output Structure
+### Output Structure
 
 ```
 predictions/
 ├── classification_predictions.json     # Classification results
-├── detection_predictions.json          # Detection results
-├── regression_predictions.json         # Regression results
-└── Segmentation/                       # Segmentation results
+├── detection_predictions.json          # Detection bboxes
+├── regression_predictions.json         # Keypoint coordinates
+└── Segmentation/                       # Segmentation masks
     ├── Two/
-    │   └── (Keep original directory structure)
     ├── Three/
     ├── Four/
     └── Five/
 ```
-**Segmentation result path**: Must maintain the same relative path as the `mask_path` field in CSV
 
-Example:
-```
-mask_path in CSV: ../Segmentation/Two/dataset_name/MASKS/mask_001.png
+**Important**: Segmentation masks must preserve the original directory structure from the CSV `mask_path` field.
 
-Output path: {output_dir}/Segmentation/Two/dataset_name/MASKS/mask_001.png
-```
+---
 
-## 🐳 Docker Build and Test
+## 🐳 Docker Deployment
 
-### ⚠️ Important Reminder
-
-**Docker is the final submission method!** Please make sure to complete the following steps before submission:
-
-### Step 1: Prepare Docker Files
-
-Copy the following files to the `docker/` directory:
+### Build Docker Image
 
 ```bash
-cd docker/
-# Required files:
-# - model.py (modified inference code)
-# - model_factory.py
-# - best_model.pth (trained model)
-# - requirements.txt
-# - Dockerfile
-```
-
-### Step 2: Build Docker Image
-
-```bash
-cd docker/
+cd docker
+chmod +x build.sh
 ./build.sh
 ```
 
-Or build manually:
+### Test Docker Image
 
 ```bash
-docker build -f Dockerfile -t my-submission:latest .
+chmod +x run_test.sh
+./run_test.sh
 ```
 
-### Step 3: Test on Validation Set ⭐
+### Required Files for Docker
 
-**This step is very important!** Before submission, you must test the Docker on the validation set:
-
-```bash
-# Method 1: Use test script
-./run_test.sh /path/to/validation /path/to/output
-
-# Method 2: Manual run
-docker run --gpus all --rm -v D:\ultrasound\val:/input/:ro -v D:\ultrasound\output:/output  my-submission:latest
+```
+docker/
+├── Dockerfile
+├── requirements.txt
+├── model.py                  # Inference script
+├── model_factory.py          # Model architecture
+├── best_model.pth            # Trained weights
+├── build.sh
+└── run_test.sh
 ```
 
-### Step 4: Validate Output Format
+### Docker Submission
 
-Check the output directory:
+After successful testing, submit your Docker image following the competition guidelines.
 
-```bash
-ls -lh /path/to/output/
+---
 
-# Should contain:
-# - classification_predictions.json
-# - detection_predictions.json
-# - regression_predictions.json
-# - Segmentation/ (directory)
+## 🔧 Advanced Usage
+
+### Custom Model Architecture
+
+To use a different encoder:
+
+```yaml
+model:
+  encoder:
+    name: "resnet50"  # or any timm/smp supported model
+    pretrained: "imagenet"
 ```
 
-### Step 5: Upload to Codabench for Evaluation
+### Task-Specific Loss Tuning
 
-1. Package output files:
-   ```bash
-   cd /path/to/output
-   zip -r predictions.zip .
-   ```
+Adjust task weights in config:
 
-2. Log in to Codabench platform
-3. Upload `predictions.zip` for validation set evaluation
-4. View evaluation results
-
-**If evaluation passes, it means Docker is built correctly!** You can proceed to the next step.
-
-### Step 6: Submit Docker Image
-
-#### Method A: Docker Hub (Recommended)
-
-```bash
-docker login
-docker tag my-submission:latest YOUR_USERNAME/my-submission:latest
-docker push YOUR_USERNAME/my-submission:latest
-
-# Send the image address to the organizing committee:
-# YOUR_USERNAME/my-submission:latest
+```yaml
+loss:
+  task_weights:
+    segmentation: 2.0      # Increase segmentation importance
+    classification: 1.0
+    detection: 0.5
+    Regression: 1.5
 ```
 
-#### Method B: Save as File
+### Data Augmentation
 
-```bash
-docker save -o my-submission.tar my-submission:latest
+Customize augmentation in config:
 
-# Upload my-submission.tar to cloud storage
-# Send the link to the organizing committee
+```yaml
+data:
+  augmentation:
+    train:
+      random_brightness_contrast: 0.3
+      gauss_noise: 0.15
+      horizontal_flip: 0.5  # Note: Use with caution for medical images
+```
+
+### Learning Rate Scheduling
+
+Multiple scheduler options available:
+
+```yaml
+training:
+  scheduler:
+    # Option 1: Cosine Annealing (Recommended)
+    type: "CosineAnnealingLR"
+    T_max: 50
+    eta_min: 1.0e-6
+    
+    # Option 2: Reduce on Plateau
+    # type: "ReduceLROnPlateau"
+    # mode: "max"
+    # factor: 0.5
+    # patience: 5
+    
+    # Option 3: Step LR
+    # type: "StepLR"
+    # step_size: 20
+    # gamma: 0.1
+```
+
+### Deep Supervision for Segmentation
+
+Enable deep supervision to improve segmentation performance:
+
+```yaml
+model:
+  heads:
+    segmentation:
+      use_deep_supervision: true
+      num_aux_outputs: 3
+      aux_loss_weights: [0.5, 0.3, 0.2]
 ```
 
 ---
 
-## ⚠️ Important Notes
+## 📊 Model Performance Tips
 
-### 1. About model.py ⭐
+### 1. Encoder Selection
 
-**`model.py` is the core file!** You can freely modify its internal implementation, but must follow these specifications:
+Different encoders have different trade-offs:
 
-#### Required Interface
+| Encoder | Parameters | Speed | Performance |
+|---------|-----------|-------|-------------|
+| `swin_t` | 28M | Fast | Good |
+| `swin_s` | 50M | Medium | Better |
+| `swin_b` | 88M | Slow | Best |
+| `resnet50` | 25M | Fast | Good |
 
-```python
-class Model:
-    def __init__(self):
-        """Initialize model"""
-        pass
-    
-    def predict(self, data_root: str, output_dir: str, batch_size: int = 8):
-        """
-        Perform inference
-        
-        Args:
-            data_root: Input data root directory (/input/ in Docker)
-            output_dir: Output directory (/output/ in Docker)
-            batch_size: Batch size
-        """
-        pass
+### 2. Batch Size and Learning Rate
+
+General rule of thumb:
+- If you increase batch size by 2x, increase learning rate by 2x
+- Recommended: batch_size=4, lr=1e-4
+
+### 3. Training Time Estimates
+
+On a single GPU (RTX 3090):
+- ~2 hours per epoch with `swin_b`, batch_size=4
+- ~1 hour per epoch with `swin_t`, batch_size=8
+
+---
+
+## 🐛 Troubleshooting
+
+### CUDA Out of Memory
+
+```yaml
+# Reduce batch size
+data:
+  batch_size: 2
+
+# Or use gradient accumulation (coming soon)
 ```
 
-#### Output Format Requirements 🔴 Important!
+### Training Loss Not Decreasing
 
-##### 1) Segmentation Task Output
+1. Check learning rate (too high/low)
+2. Verify data loading (visualize a batch)
+3. Adjust task loss weights
+4. Try different encoder initialization
 
-**Format**: Image file
+### Validation Performance Poor
 
-**Path**: Must maintain the same relative path as the `mask_path` field in CSV
+1. Reduce overfitting:
+   - Increase dropout
+   - Add more augmentation
+   - Reduce model size
+2. Check for data leakage
+3. Ensure proper train/val split
 
-Example:
-```
-mask_path in CSV: ../Segmentation/Two/dataset_name/MASKS/mask_001.png
+---
 
-Output path: {output_dir}/Segmentation/Two/dataset_name/MASKS/mask_001.png
-```
+## 📚 Key Modules Explained
 
-**Pixel values**: 
-- Background: 0
-- Class 1: 1
-- Class 2: 2
-- ...
+### Dataset (`code/data/dataset.py`)
 
-##### 2) Classification Task Output
+- **MultiTaskDataset**: Loads data from CSV files for all tasks
+- **MultiTaskUniformSampler**: Ensures balanced sampling across tasks
 
-**Format**: JSON file
+### Model (`code/models/`)
 
-**Path**: `{output_dir}/classification_predictions.json`
+- **Encoders**: Feature extraction backbones (Swin, ResNet, etc.)
+- **Decoders**: FPN for multi-scale feature aggregation
+- **Heads**: Task-specific prediction heads
+- **MultiTaskModel**: Orchestrates encoder + decoder + heads
 
-**Content**:
-```json
-[
-  {
-    "image_path": "relative/path/image_001.jpg",
-    "task_id": "breast_2cls",
-    "predicted_class": 1,
-    "predicted_probs": [0.15, 0.85]
-  },
-  ...
-]
-```
+### Losses (`code/losses/loss_functions.py`)
 
-**Description**:
-- `predicted_class`: Predicted class label (integer)
-- `predicted_probs`: Prediction probabilities for each class (array, length equals number of classes)
-  - Used to calculate evaluation metrics that require probabilities like AUC
-  - Sum of all probability values should be 1.0
+Task-specific loss functions with automatic weighting:
+- Segmentation: Dice Loss + Cross Entropy
+- Classification: Cross Entropy with class weighting
+- Detection: IoU Loss + Confidence Loss
+- Regression: Smooth L1 Loss (normalized coordinates)
 
-##### 3) Detection Task Output
+### Logger (`code/utils/logger.py`)
 
-**Format**: JSON file
+Comprehensive logging system:
+- Training/validation metrics per epoch
+- Best model tracking
+- Loss decomposition by task
 
-**Path**: `{output_dir}/detection_predictions.json`
+---
 
-**Content**:
-```json
-[
-  {
-    "image_path": "relative/path/image_001.jpg",
-    "task_id": "thyroid_nodule_det",
-    "bbox_normalized": [0.1, 0.2, 0.5, 0.6],
-    "bbox_pixels": [50, 100, 250, 300]
-  },
-  ...
-]
-```
+## 🤝 Contributing
 
-**Description**:
-- `bbox_normalized`: [x_min, y_min, x_max, y_max], normalized to [0, 1]
-- `bbox_pixels`: [x_min, y_min, x_max, y_max], pixel coordinates
+This is a competition repository. For questions or issues:
 
-##### 4) Regression Task Output
+1. Check existing documentation
+2. Review the code comments
+3. Contact competition organizers
+
+---
+
+## 📄 License
+
+This code is provided for the Foundation Model Challenge for Ultrasound Image Analysis competition.
+
+---
+
+## 🙏 Acknowledgments
+
+- **timm**: PyTorch Image Models
+- **segmentation_models.pytorch**: Segmentation architectures
+- **albumentations**: Data augmentation library
+
+---
+
+## 📞 Support
+
+For technical questions about this codebase:
+- Open an issue in the repository
+- Contact: [Competition Platform]
+
+For competition-related questions:
+- Visit the [Competition Website]
+- Check the [Forum/Discussion Board]
+
+---
+
+**Good luck with your submission! 🚀**
 
 **Format**: JSON file
 

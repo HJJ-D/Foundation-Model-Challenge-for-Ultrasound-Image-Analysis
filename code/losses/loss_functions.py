@@ -1,5 +1,6 @@
 """Loss functions for multi-task learning."""
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -117,6 +118,101 @@ def build_loss_function(task_name, loss_config):
     return loss_fn
 
 
+class AdaptiveLossWeighter(nn.Module):
+    """
+    Adaptive loss weighting for multi-task learning using uncertainty estimation.
+    
+    Based on "Multi-Task Learning Using Uncertainty to Weigh Losses for Scene Geometry and Semantics"
+    (Kendall et al., CVPR 2018)
+    
+    The loss weight for each task is computed as:
+        weight = 1 / (2 * sigma^2)
+    And a regularization term log(sigma) is added to prevent sigma from going to zero.
+    
+    Args:
+        task_names: List of task names
+        init_log_vars: Initial values for log(sigma^2). Default: 0.0 (sigma=1.0)
+    """
+    
+    def __init__(self, task_names, init_log_vars=0.0):
+        super().__init__()
+        self.task_names = task_names
+        
+        # Learnable log variance parameters (one per task)
+        # Using log(sigma^2) for numerical stability
+        if isinstance(init_log_vars, (int, float)):
+            init_log_vars = [init_log_vars] * len(task_names)
+        
+        self.log_vars = nn.ParameterDict({
+            task_name: nn.Parameter(torch.tensor(init_val, dtype=torch.float32))
+            for task_name, init_val in zip(task_names, init_log_vars)
+        })
+    
+    def forward(self, losses_dict):
+        """
+        Compute weighted loss with uncertainty.
+        
+        Args:
+            losses_dict: Dictionary mapping task_name to loss value (tensor)
+        
+        Returns:
+            total_loss: Weighted sum of losses with regularization
+            weighted_losses: Dictionary of weighted losses for logging
+            task_weights: Dictionary of computed weights for logging
+        """
+        total_loss = 0.0
+        weighted_losses = {}
+        task_weights = {}
+        
+        for task_name, loss in losses_dict.items():
+            if task_name not in self.log_vars:
+                # If task not in log_vars (shouldn't happen), use weight=1.0
+                weighted_loss = loss
+                task_weights[task_name] = 1.0
+            else:
+                log_var = self.log_vars[task_name]
+                
+                # Clamp log_var to prevent extreme values
+                # log_var ∈ [-5, 5] → sigma ∈ [0.08, 12.18] → weight ∈ [0.003, 30.1]
+                # Wider range allows more flexibility in uncertainty estimation
+                log_var_clamped = torch.clamp(log_var, min=-5.0, max=5.0)
+                
+                # Compute precision (inverse variance): 1 / sigma^2 = exp(-log_var)
+                precision = torch.exp(-log_var_clamped)
+                
+                # Weighted loss formula from Kendall et al. (CVPR 2018):
+                # L_total = (1 / (2 * sigma^2)) * L_task + log(sigma)
+                # = 0.5 * precision * L_task + 0.5 * log_var
+                weighted_loss = 0.5 * precision * loss + 0.5 * log_var_clamped
+                
+                task_weights[task_name] = (0.5 * precision).item()
+            
+            weighted_losses[task_name] = weighted_loss
+            total_loss = total_loss + weighted_loss
+        
+        return total_loss, weighted_losses, task_weights
+    
+    def get_task_weights(self):
+        """Get current task weights as a dictionary."""
+        weights = {}
+        for task_name, log_var in self.log_vars.items():
+            # Apply same clamping as in forward pass for consistency
+            log_var_clamped = torch.clamp(log_var, min=-5.0, max=5.0)
+            precision = torch.exp(-log_var_clamped)
+            weights[task_name] = (0.5 * precision).item()
+        return weights
+    
+    def get_sigmas(self):
+        """Get current sigma values (uncertainty) as a dictionary."""
+        sigmas = {}
+        for task_name, log_var in self.log_vars.items():
+            # Apply same clamping as in forward pass for consistency
+            log_var_clamped = torch.clamp(log_var, min=-5.0, max=5.0)
+            sigma = torch.exp(0.5 * log_var_clamped)
+            sigmas[task_name] = sigma.item()
+        return sigmas
+
+
 def build_all_losses(config):
     """
     Build all loss functions from configuration.
@@ -126,10 +222,9 @@ def build_all_losses(config):
     
     Returns:
         loss_functions: Dictionary mapping task_name to loss function
-        loss_weights: Dictionary mapping task_name to loss weight
+        loss_weights: Dictionary mapping task_name to loss weight (or AdaptiveLossWeighter)
     """
     loss_functions = {}
-    loss_weights = config.get('training.loss_weights', {})
     
     # Get unique task names
     task_names = set()
@@ -142,9 +237,40 @@ def build_all_losses(config):
         loss_fn = build_loss_function(task_name, loss_config)
         loss_functions[task_name] = loss_fn
     
-    print(f"✓ Built {len(loss_functions)} loss functions:")
-    for task_name, loss_fn in loss_functions.items():
-        weight = loss_weights.get(task_name, 1.0)
-        print(f"  - {task_name}: {loss_fn.__class__.__name__} (weight={weight})")
+    # Check if using adaptive loss weighting
+    use_adaptive_loss = config.get('training.adaptive_loss.enabled', False)
     
-    return loss_functions, loss_weights
+    if use_adaptive_loss:
+        # Check for per-task initialization
+        init_log_vars_per_task = config.get('training.adaptive_loss.init_log_vars_per_task', None)
+        
+        if init_log_vars_per_task:
+            # Use per-task initialization
+            init_log_vars = [init_log_vars_per_task.get(task_name, 0.0) for task_name in task_names]
+            print(f"✓ Built {len(loss_functions)} loss functions with Adaptive Loss Weighting (per-task init):")
+            for task_name, init_val in zip(task_names, init_log_vars):
+                sigma = np.exp(0.5 * init_val)
+                weight = 0.5 * np.exp(-init_val)
+                print(f"  - {task_name}: init_log_var={init_val:.2f}, sigma={sigma:.2f}, weight={weight:.2f}")
+        else:
+            # Use same initialization for all tasks
+            init_log_vars = config.get('training.adaptive_loss.init_log_vars', 0.0)
+            sigma = np.exp(0.5 * init_log_vars)
+            weight = 0.5 * np.exp(-init_log_vars)
+            print(f"✓ Built {len(loss_functions)} loss functions with Adaptive Loss Weighting:")
+            print(f"  Initial: log_var={init_log_vars:.2f}, sigma={sigma:.2f}, weight={weight:.2f}")
+            for task_name, loss_fn in loss_functions.items():
+                print(f"  - {task_name}: {loss_fn.__class__.__name__}")
+        
+        loss_weighter = AdaptiveLossWeighter(list(task_names), init_log_vars)
+        
+        return loss_functions, loss_weighter
+    else:
+        loss_weights = config.get('training.loss_weights', {})
+        
+        print(f"✓ Built {len(loss_functions)} loss functions:")
+        for task_name, loss_fn in loss_functions.items():
+            weight = loss_weights.get(task_name, 1.0)
+            print(f"  - {task_name}: {loss_fn.__class__.__name__} (weight={weight})")
+        
+        return loss_functions, loss_weights

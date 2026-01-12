@@ -1,4 +1,3 @@
-data/
 *.pyc
 MTUS-Net/
 MTUS-Net.zip
@@ -7,3 +6,4 @@ docker/
 old_code/
 plot_training.py
 *.md
+quick_example.py
