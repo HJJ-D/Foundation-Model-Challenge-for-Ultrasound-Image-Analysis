@@ -20,7 +20,6 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from typing import Optional
 
-# Import from refactored code (直接导入，因为文件已经在 code/ 目录下)
 from models.multitask_model import MultiTaskModel
 from utils.common import set_seed
 from configs import Config
