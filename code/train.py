@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from collections import defaultdict
@@ -51,16 +51,15 @@ def build_dataloaders(config):
         ToTensorV2(),
     ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['class_labels'], clip=True, min_visibility=0.1))
     
-    # Create datasets
-    train_dataset = MultiTaskDataset(data_root=config.data_root, transforms=train_transforms)
-    val_dataset = MultiTaskDataset(data_root=config.data_root, transforms=val_transforms)
+    # Create full dataset first
+    full_dataset = MultiTaskDataset(data_root=config.data_root, transforms=None)
     
     # Build task_configs dynamically from dataset (like original code)
     print("\nBuilding task configurations from dataset...")
     task_configs = []
     task_config_map = {}
     
-    for _, row in train_dataset.dataframe.iterrows():
+    for _, row in full_dataset.dataframe.iterrows():
         task_id = row['task_id']
         if task_id not in task_config_map:
             task_config = {
@@ -78,11 +77,32 @@ def build_dataloaders(config):
     for cfg in sorted(task_configs, key=lambda x: x['task_id']):
         print(f"  - {cfg['task_id']}: {cfg['task_name']}, num_classes={cfg['num_classes']}")
     
-    dataset_size = len(train_dataset)
+    # randomly split dataset into train and val
+    dataset_size = len(full_dataset)
     val_size = int(dataset_size * config.val_split)
     train_size = dataset_size - val_size
     
-    # Create samplers (no subset, use full datasets with sampler)
+    # get shuffled indices
+    indices = list(range(dataset_size))
+    np.random.seed(config.seed)  # use seed for reproducibility
+    np.random.shuffle(indices)
+    
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:]
+    
+    print(f"\n✓ Dataset split (seed={config.seed}):")
+    print(f"  - Total samples: {dataset_size}")
+    print(f"  - Train samples: {train_size} ({100*(1-config.val_split):.1f}%)")
+    print(f"  - Val samples: {val_size} ({100*config.val_split:.1f}%)")
+    
+    # create subsets
+    train_dataset = MultiTaskDataset(data_root=config.data_root, transforms=train_transforms)
+    train_dataset.dataframe = full_dataset.dataframe.iloc[train_indices].reset_index(drop=True)
+    
+    val_dataset = MultiTaskDataset(data_root=config.data_root, transforms=val_transforms)
+    val_dataset.dataframe = full_dataset.dataframe.iloc[val_indices].reset_index(drop=True)
+    
+    # Create samplers
     train_sampler = MultiTaskUniformSampler(
         dataset=train_dataset,
         batch_size=config.batch_size,
@@ -107,8 +127,6 @@ def build_dataloaders(config):
         pin_memory=config.get('data.pin_memory', True),
         collate_fn=multi_task_collate_fn
     )
-    
-    print(f"✓ Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
     
     return train_loader, val_loader
 
