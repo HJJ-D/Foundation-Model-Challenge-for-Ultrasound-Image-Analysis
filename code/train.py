@@ -15,6 +15,7 @@ from albumentations.pytorch import ToTensorV2
 from collections import defaultdict
 from tqdm import tqdm
 import numpy as np
+import pandas as pd
 
 # Import modular components
 from configs import load_config
@@ -77,23 +78,30 @@ def build_dataloaders(config):
     for cfg in sorted(task_configs, key=lambda x: x['task_id']):
         print(f"  - {cfg['task_id']}: {cfg['task_name']}, num_classes={cfg['num_classes']}")
     
-    # randomly split dataset into train and val
+   # split dataset into train and val while preserving per-task ratios
     dataset_size = len(full_dataset)
-    val_size = int(dataset_size * config.val_split)
-    train_size = dataset_size - val_size
+    rng = np.random.RandomState(config.seed)  # use seed for reproducibility
+    df = full_dataset.dataframe
     
-    # get shuffled indices
-    indices = list(range(dataset_size))
-    np.random.seed(config.seed)  # use seed for reproducibility
-    np.random.shuffle(indices)
+    train_indices = []
+    val_indices = []
+    for task_id, group in df.groupby('task_id'):
+        group_indices = group.index.to_numpy()
+        rng.shuffle(group_indices)
+        group_val_size = int(len(group_indices) * config.val_split)
+        val_indices.extend(group_indices[:group_val_size].tolist())
+        train_indices.extend(group_indices[group_val_size:].tolist())
     
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+    
+    train_size = len(train_indices)
+    val_size = len(val_indices)
     
     print(f"\n✓ Dataset split (seed={config.seed}):")
     print(f"  - Total samples: {dataset_size}")
-    print(f"  - Train samples: {train_size} ({100*(1-config.val_split):.1f}%)")
-    print(f"  - Val samples: {val_size} ({100*config.val_split:.1f}%)")
+    print(f"  - Train samples: {train_size} ({100*(train_size/dataset_size):.1f}%)")
+    print(f"  - Val samples: {val_size} ({100*(val_size/dataset_size):.1f}%)")
     
     # create subsets
     train_dataset = MultiTaskDataset(data_root=config.data_root, transforms=train_transforms)
@@ -445,6 +453,27 @@ def main(config_path=None):
         if not val_results_df.empty:
             print(val_results_df.to_string(index=False))
         print(f"--- Average Validation Score (Higher is better): {avg_val_score:.4f} ---")
+        
+        # Print validation summary (similar format to train summary)
+        print(f"\nEpoch {epoch+1} Val Summary:")
+        if not val_results_df.empty:
+            for _, row in val_results_df.iterrows():
+                task_id = row['Task ID']
+                task_name = row['Task Name']
+                # Collect key metrics for summary
+                metrics_str_parts = []
+                if 'Accuracy' in row and pd.notna(row['Accuracy']):
+                    metrics_str_parts.append(f"Acc={row['Accuracy']:.4f}")
+                if 'F1-Score' in row and pd.notna(row['F1-Score']):
+                    metrics_str_parts.append(f"F1={row['F1-Score']:.4f}")
+                if 'Dice' in row and pd.notna(row['Dice']):
+                    metrics_str_parts.append(f"Dice={row['Dice']:.4f}")
+                if 'IoU' in row and pd.notna(row['IoU']):
+                    metrics_str_parts.append(f"IoU={row['IoU']:.4f}")
+                if 'MAE (pixels)' in row and pd.notna(row['MAE (pixels)']):
+                    metrics_str_parts.append(f"MAE={row['MAE (pixels)']:.4f}")
+                metrics_str = ", ".join(metrics_str_parts) if metrics_str_parts else "N/A"
+                print(f"  {task_id:<30}: {metrics_str}")
         
         # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr']
