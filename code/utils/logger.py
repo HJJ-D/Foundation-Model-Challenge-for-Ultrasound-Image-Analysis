@@ -116,6 +116,7 @@ class TrainingLogger:
         self._save_json()
         self._save_train_losses_csv()
         self._save_val_metrics_csv()
+        # Also save a human-readable validation summary (per-epoch)
         self._save_summary_csv()
     
     def _save_json(self):
@@ -243,6 +244,93 @@ class TrainingLogger:
         
         df = pd.DataFrame(rows)
         df.to_csv(self.summary_csv, index=False, encoding='utf-8')
+
+    def _save_val_summary_txt(self):
+        """Save a human-readable validation summary for the latest epoch.
+
+        This writes `val_summary.txt` in the experiment directory containing:
+          - Per-task validation metrics for the most recent epoch
+          - Mean primary metric for the four high-level task groups:
+            classification, segmentation, keypoint, measurement
+        """
+        if not self.history['epochs']:
+            return
+
+        last_epoch = self.history['epochs'][-1]
+        epoch = last_epoch['epoch']
+        timestamp = last_epoch['timestamp']
+
+        if 'val_metrics' not in last_epoch or not last_epoch['val_metrics']:
+            return
+
+        lines = []
+        lines.append(f"Validation Summary - Best Epoch {epoch}")
+        lines.append(f"Timestamp: {timestamp}")
+        lines.append("")
+        lines.append("Per-task validation metrics of Best Epoch:")
+        lines.append("")
+
+        # Collect per-task lines and also group metrics
+        group_names = ['classification', 'segmentation', 'detection', 'regression']
+        group_vals = {g: [] for g in group_names}
+
+        for task_id in sorted(last_epoch['val_metrics'].keys(), key=lambda x: int(x) if str(x).isdigit() else str(x)):
+            task_data = last_epoch['val_metrics'][task_id]
+            task_name = task_data.get('task_name', '')
+            metrics = task_data.get('metrics', {})
+
+            # Format per-task line
+            metric_parts = []
+            for k, v in metrics.items():
+                if v is None:
+                    metric_parts.append(f"{k}: N/A")
+                else:
+                    try:
+                        metric_parts.append(f"{k}: {float(v):.4f}")
+                    except Exception:
+                        metric_parts.append(f"{k}: {v}")
+
+            lines.append(f"  - Task {task_id} | {task_name} -> " + ", ".join(metric_parts))
+
+            # Determine group membership (simple substring match)
+            tn = str(task_name).lower()
+            for g in group_names:
+                if g in tn:
+                    # Select primary metric per group
+                    if g == 'classification':
+                        val = metrics.get('F1-Score') or metrics.get('Accuracy')
+                    elif g == 'segmentation':
+                        val = metrics.get('Dice') or metrics.get('IoU')
+                    elif g == 'detection':
+                        val = metrics.get('mAP') or metrics.get('AP') or metrics.get('F1-Score')
+                    else:  # regression
+                        val = metrics.get('MAE') or metrics.get('MAE (pixels)') or metrics.get('RMSE') or metrics.get('MSE')
+
+                    if val is not None:
+                        try:
+                            group_vals[g].append(float(val))
+                        except Exception:
+                            pass
+
+        lines.append("")
+        lines.append("Group mean primary metrics:")
+        for g in group_names:
+            vals = group_vals[g]
+            if vals:
+                mean_val = float(np.mean(vals))
+                # For regression-like groups lower is better; keep numeric value
+                lines.append(f"  - {g.title()}: {mean_val:.4f} (mean over {len(vals)} task(s))")
+            else:
+                lines.append(f"  - {g.title()}: N/A (no tasks found)")
+
+        # Write to file
+        out_path = self.experiment_dir / 'val_summary.txt'
+        try:
+            with open(out_path, 'w', encoding='utf-8') as f:
+                for l in lines:
+                    f.write(l + "\n")
+        except Exception as e:
+            print(f"Could not write val_summary.txt: {e}")
     
     def save_config(self, config_dict):
         """Save training configuration."""

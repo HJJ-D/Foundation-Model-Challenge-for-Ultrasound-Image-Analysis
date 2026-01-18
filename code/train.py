@@ -504,8 +504,7 @@ def main(config_path=None):
             best_val_score = avg_val_score
             best_epoch = epoch + 1
             torch.save(model.state_dict(), best_model_path)
-            print(f"✓ New best model saved! Score improved to: {best_val_score:.4f}")
-            print(f"  Model saved at: {best_model_path}\n")
+            logger._save_val_summary_txt()
         
         # Step scheduler
         if scheduler is not None:
