@@ -300,11 +300,11 @@ class TrainingLogger:
                     if g == 'classification':
                         val = metrics.get('F1-Score') or metrics.get('Accuracy')
                     elif g == 'segmentation':
-                        val = metrics.get('Dice') or metrics.get('IoU')
+                        val = metrics.get('Dice')
                     elif g == 'detection':
-                        val = metrics.get('mAP') or metrics.get('AP') or metrics.get('F1-Score')
+                        val = metrics.get('IoU')
                     else:  # regression
-                        val = metrics.get('MAE') or metrics.get('MAE (pixels)') or metrics.get('RMSE') or metrics.get('MSE')
+                        val = metrics.get('MAE') or metrics.get('MAE (pixels)')
 
                     if val is not None:
                         try:
