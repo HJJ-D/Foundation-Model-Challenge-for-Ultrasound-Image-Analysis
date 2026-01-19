@@ -11,6 +11,7 @@ SWIN_MODEL_MAPPING = {
     'swin_t': 'swin_tiny_patch4_window7_224',
     'swin_s': 'swin_small_patch4_window7_224',
     'swin_b': 'swin_base_patch4_window7_224',
+    'swin_l': 'swin_large_patch4_window7_224',
 }
 
 
