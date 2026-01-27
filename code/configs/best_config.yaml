@@ -2,7 +2,7 @@
 
 # Experiment settings
 experiment:
-  name: "Vit_AdaptiveLoss_film_multitask"
+  name: "Best_Model"
   seed: 42
   output_dir: "outputs"
   save_checkpoints: true
@@ -35,7 +35,7 @@ data:
 model:
   # Encoder settings
   encoder:
-    name: "vit_b"  # swin_t, swin_s, swin_b, or any timm/smp model
+    name: "swin_b"  # swin_t, swin_s, swin_b, or any timm/smp model
     pretrained: "imagenet"
     freeze_encoder: false
   
@@ -65,7 +65,7 @@ model:
   # Task heads
   heads:
     segmentation:
-      type: "unet_like"
+      type: "default"
       upsampling: 4
       mid_channels: 128
       num_blocks: 2
@@ -76,7 +76,7 @@ model:
     
     classification:
       mid_channels: 256
-      mlp_hidden_dim: 512
+      # mlp_hidden_dim: 512
       dropout: 0.3
     
     detection:

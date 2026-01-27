@@ -5,6 +5,7 @@ import torch.nn as nn
 from .encoders import build_encoder
 from .decoders import build_decoders
 from .heads import build_all_heads
+from .film_layer import TaskFiLMGenerator, TaskEmbeddingFiLMGenerator, FiLMLayer
 
 
 class MultiTaskModel(nn.Module):
@@ -39,9 +40,43 @@ class MultiTaskModel(nn.Module):
         decoders = build_decoders(self.encoder, config)
         self.fpn_decoder_seg = decoders['fpn_seg']
         self.fpn_decoder_det = decoders['fpn_det']
+        self.fpn_decoder_cls = decoders['fpn_cls']
+        self.fpn_decoder_reg = decoders['fpn_reg']
+        self.use_fpn_for_cls = config.get('model.decoder.use_fpn_for_classification', True)
+        self.use_fpn_for_reg = config.get('model.decoder.use_fpn_for_regression', True)
         
         # Get FPN output channels
         self.fpn_out_channels = self.fpn_decoder_seg.out_channels
+        
+        # Build FiLM modulation (optional)
+        self.use_film = config.get('model.use_film', False)
+        if self.use_film:
+            task_ids = [cfg['task_id'] for cfg in self.task_configs]
+            film_config = config.get('model.film', {})
+            use_embedding = film_config.get('use_task_embedding', False)
+            embedding_dim = film_config.get('embedding_dim', 64)
+            use_affine = film_config.get('use_affine', True)
+            
+            if use_embedding:
+                self.film_generator = TaskEmbeddingFiLMGenerator(
+                    task_ids=task_ids,
+                    num_features=self.fpn_out_channels,
+                    embedding_dim=embedding_dim,
+                    use_affine=use_affine
+                )
+                print(f"✓ Using FiLM with task embeddings (dim={embedding_dim})")
+            else:
+                self.film_generator = TaskFiLMGenerator(
+                    task_ids=task_ids,
+                    num_features=self.fpn_out_channels,
+                    use_affine=use_affine
+                )
+                print(f"✓ Using FiLM with per-task parameters")
+            
+            self.film_layer = FiLMLayer(
+                num_features=self.fpn_out_channels,
+                use_affine=use_affine
+            )
         
         # Build task-specific heads
         model_config = config.config.get('model', {})
@@ -92,15 +127,43 @@ class MultiTaskModel(nn.Module):
         # Route through appropriate decoder and head
         if task_name == 'segmentation':
             fpn_features = self.fpn_decoder_seg(features)
+            
+            # Apply FiLM modulation if enabled
+            if self.use_film:
+                gamma, beta = self.film_generator(task_id)
+                fpn_features = self.film_layer(fpn_features, condition=(gamma, beta))
+            
             output = self.heads[task_id](fpn_features)
         
         elif task_name == 'detection':
             fpn_features = self.fpn_decoder_det(features)
+            
+            # Apply FiLM modulation if enabled
+            if self.use_film:
+                gamma, beta = self.film_generator(task_id)
+                fpn_features = self.film_layer(fpn_features, condition=(gamma, beta))
+            
             output = self.heads[task_id](fpn_features)
         
-        else:  # classification or regression
-            # Use encoder features directly
-            output = self.heads[task_id](features)
+        elif task_name == 'classification':
+            if self.use_fpn_for_cls:
+                fpn_features = self.fpn_decoder_cls(features)
+                if self.use_film:
+                    gamma, beta = self.film_generator(task_id)
+                    fpn_features = self.film_layer(fpn_features, condition=(gamma, beta))
+                output = self.heads[task_id](fpn_features)
+            else:
+                output = self.heads[task_id](features)
+
+        else:  # regression
+            if self.use_fpn_for_reg:
+                fpn_features = self.fpn_decoder_reg(features)
+                if self.use_film:
+                    gamma, beta = self.film_generator(task_id)
+                    fpn_features = self.film_layer(fpn_features, condition=(gamma, beta))
+                output = self.heads[task_id](fpn_features)
+            else:
+                output = self.heads[task_id](features)
         
         return output
     
@@ -118,6 +181,14 @@ class MultiTaskModel(nn.Module):
         head_params += list(self.fpn_decoder_seg.parameters())
         if self.fpn_decoder_det is not self.fpn_decoder_seg:
             head_params += list(self.fpn_decoder_det.parameters())
+        if self.use_fpn_for_cls and self.fpn_decoder_cls not in (self.fpn_decoder_seg, self.fpn_decoder_det):
+            head_params += list(self.fpn_decoder_cls.parameters())
+        if self.use_fpn_for_reg and self.fpn_decoder_reg not in (
+            self.fpn_decoder_seg,
+            self.fpn_decoder_det,
+            self.fpn_decoder_cls,
+        ):
+            head_params += list(self.fpn_decoder_reg.parameters())
         head_params += list(self.heads.parameters())
         
         return encoder_params, head_params

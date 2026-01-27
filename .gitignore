@@ -7,3 +7,4 @@ old_code/
 plot_training.py
 *.md
 quick_example.py
+dataset/

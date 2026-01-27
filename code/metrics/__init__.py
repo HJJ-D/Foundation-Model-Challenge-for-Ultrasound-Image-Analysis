@@ -121,19 +121,46 @@ def evaluate(model, val_loader, device, task_configs):
                     task_metrics[task_id]['MAE (pixels)'].append(calculate_mae(task_labels, outputs))
                 
                 elif task_name == 'detection':
-                    # Logic to extract best bounding box from grid prediction
-                    batch_size, _, h, w = outputs.shape
-                    scores = outputs[:, 4, :, :].view(batch_size, -1) 
-                    _, best_indices = torch.max(scores, dim=1)
-                    
-                    best_h = best_indices // w
-                    best_w = best_indices % w
-                    
-                    final_boxes = torch.zeros((batch_size, 4), device=device)
-                    for i in range(batch_size):
-                        final_boxes[i] = outputs[i, :4, best_h[i], best_w[i]]
-                    
-                    task_metrics[task_id]['IoU'].append(calculate_iou(task_labels, final_boxes))
+                    if isinstance(outputs, dict) and 'heatmap' in outputs:
+                        heatmap = outputs['heatmap']
+                        size = outputs['size']
+                        offset = outputs['offset']
+                        batch_size, _, h, w = heatmap.shape
+                        scores = heatmap.view(batch_size, -1)
+                        _, best_indices = torch.max(scores, dim=1)
+
+                        best_h = best_indices // w
+                        best_w = best_indices % w
+
+                        final_boxes = torch.zeros((batch_size, 4), device=device)
+                        for i in range(batch_size):
+                            off_x = offset[i, 0, best_h[i], best_w[i]]
+                            off_y = offset[i, 1, best_h[i], best_w[i]]
+                            cx = (best_w[i].float() + off_x) / w
+                            cy = (best_h[i].float() + off_y) / h
+                            box_w = size[i, 0, best_h[i], best_w[i]]
+                            box_h = size[i, 1, best_h[i], best_w[i]]
+                            x1 = cx - box_w * 0.5
+                            y1 = cy - box_h * 0.5
+                            x2 = cx + box_w * 0.5
+                            y2 = cy + box_h * 0.5
+                            final_boxes[i] = torch.stack([x1, y1, x2, y2]).clamp(0.0, 1.0)
+
+                        task_metrics[task_id]['IoU'].append(calculate_iou(task_labels, final_boxes))
+                    else:
+                        # Logic to extract best bounding box from grid prediction
+                        batch_size, _, h, w = outputs.shape
+                        scores = outputs[:, 4, :, :].view(batch_size, -1) 
+                        _, best_indices = torch.max(scores, dim=1)
+                        
+                        best_h = best_indices // w
+                        best_w = best_indices % w
+                        
+                        final_boxes = torch.zeros((batch_size, 4), device=device)
+                        for i in range(batch_size):
+                            final_boxes[i] = outputs[i, :4, best_h[i], best_w[i]]
+                        
+                        task_metrics[task_id]['IoU'].append(calculate_iou(task_labels, final_boxes))
 
     # Build results dataframe
     results = []

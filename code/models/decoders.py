@@ -26,8 +26,8 @@ def build_fpn_decoder(encoder, config, decoder_type='seg'):
     dropout = config.get('model.decoder.dropout', 0.2)
     merge_policy = config.get('model.decoder.merge_policy', 'cat')
     
-    if encoder_name.startswith('swin_'):
-        # For Swin encoder, use custom FPN decoder
+    if getattr(encoder, "is_timm_encoder", False):
+        # For timm-based encoders, use custom FPN decoder
         encoder_channels = encoder.out_channels
         decoder = FPNDecoder(
             encoder_channels=encoder_channels,
@@ -48,8 +48,14 @@ def build_fpn_decoder(encoder, config, decoder_type='seg'):
         )
         decoder = temp_model.decoder
     
-    suffix = 'detection' if decoder_type == 'det' else 'segmentation'
-    print(f"✓ Built FPN decoder for {suffix}")
+    suffix_map = {
+        'seg': 'segmentation',
+        'det': 'detection',
+        'cls': 'classification',
+        'reg': 'regression',
+    }
+    suffix = suffix_map.get(decoder_type, decoder_type)
+    print(f"Built FPN decoder for {suffix}")
     
     return decoder
 
@@ -73,9 +79,25 @@ def build_decoders(encoder, config):
     # Detection FPN decoder (separate or shared)
     if config.get('model.decoder.separate_detection_fpn', True):
         decoders['fpn_det'] = build_fpn_decoder(encoder, config, decoder_type='det')
-        print("✓ Using separate FPN decoder for detection")
+        print("Using separate FPN decoder for detection")
     else:
         decoders['fpn_det'] = decoders['fpn_seg']  # Share with segmentation
-        print("✓ Sharing FPN decoder between segmentation and detection")
+        print("Sharing FPN decoder between segmentation and detection")
+
+    # Classification FPN decoder (separate or shared)
+    if config.get('model.decoder.separate_classification_fpn', True):
+        decoders['fpn_cls'] = build_fpn_decoder(encoder, config, decoder_type='cls')
+        print("Using separate FPN decoder for classification")
+    else:
+        decoders['fpn_cls'] = decoders['fpn_seg']  # Share with segmentation
+        print("Sharing FPN decoder between segmentation and classification")
+
+    # Regression FPN decoder (separate or shared)
+    if config.get('model.decoder.separate_regression_fpn', True):
+        decoders['fpn_reg'] = build_fpn_decoder(encoder, config, decoder_type='reg')
+        print("Using separate FPN decoder for regression")
+    else:
+        decoders['fpn_reg'] = decoders['fpn_seg']  # Share with segmentation
+        print("Sharing FPN decoder between segmentation and regression")
     
     return decoders

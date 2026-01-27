@@ -245,13 +245,14 @@ class TrainingLogger:
         df = pd.DataFrame(rows)
         df.to_csv(self.summary_csv, index=False, encoding='utf-8')
 
-    def _save_val_summary_txt(self):
+    def _save_best_model_summary_txt(self, best_model_eval_on_train=None):
         """Save a human-readable validation summary for the latest epoch.
 
-        This writes `val_summary.txt` in the experiment directory containing:
+        This writes `best_model_summary.txt` in the experiment directory containing:
           - Per-task validation metrics for the most recent epoch
           - Mean primary metric for the four high-level task groups:
-            classification, segmentation, keypoint, measurement
+            classification, segmentation, detection, regression
+          - Best model evaluation on the training set (if provided)
         """
         if not self.history['epochs']:
             return
@@ -273,6 +274,7 @@ class TrainingLogger:
         # Collect per-task lines and also group metrics
         group_names = ['classification', 'segmentation', 'detection', 'regression']
         group_vals = {g: [] for g in group_names}
+        classification_metrics = {'Accuracy': [], 'F1-Score': []}
 
         for task_id in sorted(last_epoch['val_metrics'].keys(), key=lambda x: int(x) if str(x).isdigit() else str(x)):
             task_data = last_epoch['val_metrics'][task_id]
@@ -298,15 +300,26 @@ class TrainingLogger:
                 if g in tn:
                     # Select primary metric per group
                     if g == 'classification':
-                        val = metrics.get('F1-Score') or metrics.get('Accuracy')
+                        acc = metrics.get('Accuracy')
+                        f1 = metrics.get('F1-Score')
+                        if acc is not None:
+                            try:
+                                classification_metrics['Accuracy'].append(float(acc))
+                            except Exception:
+                                pass
+                        if f1 is not None:
+                            try:
+                                classification_metrics['F1-Score'].append(float(f1))
+                            except Exception:
+                                pass
                     elif g == 'segmentation':
-                        val = metrics.get('Dice')
+                        val = metrics.get('Dice') or metrics.get('IoU')
                     elif g == 'detection':
                         val = metrics.get('IoU')
                     else:  # regression
                         val = metrics.get('MAE') or metrics.get('MAE (pixels)')
 
-                    if val is not None:
+                    if val is not None and g != 'classification':  # Skip classification here since it's handled separately
                         try:
                             group_vals[g].append(float(val))
                         except Exception:
@@ -315,22 +328,52 @@ class TrainingLogger:
         lines.append("")
         lines.append("Group mean primary metrics:")
         for g in group_names:
-            vals = group_vals[g]
-            if vals:
-                mean_val = float(np.mean(vals))
-                # For regression-like groups lower is better; keep numeric value
-                lines.append(f"  - {g.title()}: {mean_val:.4f} (mean over {len(vals)} task(s))")
+            if g == 'classification':  # Special handling for classification
+                acc_vals = classification_metrics['Accuracy']
+                f1_vals = classification_metrics['F1-Score']
+                if acc_vals:
+                    mean_acc = float(np.mean(acc_vals))
+                    lines.append(f"  - Classification Accuracy: {mean_acc:.4f} (mean over {len(acc_vals)} task(s))")
+                else:
+                    lines.append(f"  - Classification Accuracy: N/A (no tasks found)")
+                if f1_vals:
+                    mean_f1 = float(np.mean(f1_vals))
+                    lines.append(f"  - Classification F1-Score: {mean_f1:.4f} (mean over {len(f1_vals)} task(s))")
+                else:
+                    lines.append(f"  - Classification F1-Score: N/A (no tasks found)")
             else:
-                lines.append(f"  - {g.title()}: N/A (no tasks found)")
+                vals = group_vals[g]
+                if vals:
+                    mean_val = float(np.mean(vals))
+                    # For regression-like groups lower is better; keep numeric value
+                    lines.append(f"  - {g.title()}: {mean_val:.4f} (mean over {len(vals)} task(s))")
+                else:
+                    lines.append(f"  - {g.title()}: N/A (no tasks found)")
+
+        # Add best model evaluation on training set if provided
+        if best_model_eval_on_train:
+            lines.append("")
+            lines.append("Best Model Evaluation on Training Set:")
+            for task_group, score in best_model_eval_on_train.items():
+                if isinstance(score, dict):
+                    acc = score.get("Accuracy")
+                    f1 = score.get("F1-Score")
+                    acc_str = f"{acc:.4f}" if acc is not None else "N/A"
+                    f1_str = f"{f1:.4f}" if f1 is not None else "N/A"
+                    lines.append(f"  - {task_group.title()}: Accuracy={acc_str}, F1-Score={f1_str}")
+                elif score is not None:
+                    lines.append(f"  - {task_group.title()}: {score:.4f}")
+                else:
+                    lines.append(f"  - {task_group.title()}: N/A")
 
         # Write to file
-        out_path = self.experiment_dir / 'val_summary.txt'
+        out_path = self.experiment_dir / 'best_model_summary.txt'
         try:
             with open(out_path, 'w', encoding='utf-8') as f:
                 for l in lines:
                     f.write(l + "\n")
         except Exception as e:
-            print(f"Could not write val_summary.txt: {e}")
+            print(f"Could not write best_model_summary.txt: {e}")
     
     def save_config(self, config_dict):
         """Save training configuration."""
@@ -442,6 +485,8 @@ def plot_training_curves(log_dir, save_path=None):
         ax2.plot(summary_df['epoch'], summary_df['avg_dice'], marker='d', label='Dice', linewidth=2)
     if 'avg_iou' in summary_df.columns:
         ax2.plot(summary_df['epoch'], summary_df['avg_iou'], marker='v', label='IoU', linewidth=2)
+    if 'avg_mae' in summary_df.columns:
+        ax2.plot(summary_df['epoch'], summary_df['avg_mae'], marker='x', label='MAE', linewidth=2, color='tab:orange')
     ax2.set_xlabel('Epoch')
     ax2.set_ylabel('Score')
     ax2.set_title('Validation Metrics')
@@ -483,9 +528,10 @@ def plot_training_curves(log_dir, save_path=None):
 
 def plot_comprehensive_training_curves(log_dir, save_path=None):
     """
-    Plot comprehensive training curves with per-task and average metrics.
-    Shows both training and validation metrics for all 4 tasks plus overall average.
-    
+    Plot comprehensive training curves with per-group and average metrics.
+    Shows both training and validation metrics for classification/segmentation/
+    detection/regression groups plus overall average.
+
     Args:
         log_dir: Path to the log directory
         save_path: Path to save the plot (optional)
@@ -497,255 +543,315 @@ def plot_comprehensive_training_curves(log_dir, save_path=None):
     except ImportError:
         print("matplotlib and seaborn are required for plotting")
         return
-    
+
     log_dir = Path(log_dir)
-    
+
     # Load data
-    train_df = pd.read_csv(log_dir / 'train_losses.csv')
     val_df = pd.read_csv(log_dir / 'val_metrics.csv')
     summary_df = pd.read_csv(log_dir / 'training_summary.csv')
     history = load_training_history(log_dir)
-    
-    # Task names mapping
-    task_names = {
-        1: 'Classification',
-        2: 'Segmentation', 
-        3: 'Keypoint',
-        4: 'Measurement'
-    }
-    
-    # Colors for tasks
+
+    if not history.get('epochs'):
+        print("No training history found, cannot plot comprehensive curves.")
+        return
+
+    # Build task_id -> task_name map from validation metrics
+    task_id_to_name = {}
+    if not val_df.empty and {'task_id', 'task_name'}.issubset(val_df.columns):
+        for _, row in val_df[['task_id', 'task_name']].dropna().drop_duplicates().iterrows():
+            task_id_to_name[str(row['task_id'])] = str(row['task_name'])
+
+    if not task_id_to_name:
+        for epoch_data in history.get('epochs', []):
+            for task_id, task_data in epoch_data.get('val_metrics', {}).items():
+                tname = task_data.get('task_name')
+                if tname:
+                    task_id_to_name[str(task_id)] = str(tname)
+
+    def map_group(task_name):
+        if not task_name:
+            return None
+        tn = str(task_name).lower()
+        if 'classification' in tn:
+            return 'Classification'
+        if 'segmentation' in tn:
+            return 'Segmentation'
+        if 'detection' in tn:
+            return 'Detection'
+        if 'regression' in tn:
+            return 'Regression'
+        return None
+
+    def pick_metric(metrics, keys):
+        for key in keys:
+            if key in metrics and metrics[key] is not None:
+                return metrics[key]
+        return None
+
+    group_order = ['Classification', 'Segmentation', 'Detection', 'Regression']
+
+    # Colors for groups
     task_colors = {
-        1: '#1f77b4',  # Blue
-        2: '#ff7f0e',  # Orange
-        3: '#2ca02c',  # Green
-        4: '#d62728',  # Red
+        'Classification': '#1f77b4',  # Blue
+        'Segmentation': '#ff7f0e',    # Orange
+        'Detection': '#2ca02c',       # Green
+        'Regression': '#d62728',      # Red
     }
     avg_color = '#9467bd'  # Purple for average
-    
+
     # ==================== Figure 1: Training Losses ====================
     fig1, axes1 = plt.subplots(2, 3, figsize=(18, 10))
-    fig1.suptitle('Training Loss - Per Task & Average', fontsize=16, fontweight='bold')
-    
-    # Extract per-task training losses
-    epochs = summary_df['epoch'].values
-    task_train_losses = {task_id: [] for task_id in [1, 2, 3, 4]}
-    
+    fig1.suptitle('Training Loss - Per Group & Average', fontsize=16, fontweight='bold')
+
+    # Extract per-group training losses
+    epochs = [epoch_data['epoch'] for epoch_data in history['epochs']]
+    group_train_losses = {group: [] for group in group_order}
+
     for epoch_data in history['epochs']:
-        for task_id in [1, 2, 3, 4]:
-            task_key = str(task_id)
-            if task_key in epoch_data['train_losses']:
-                task_train_losses[task_id].append(epoch_data['train_losses'][task_key]['mean'])
+        group_values = {group: [] for group in group_order}
+        for task_id, loss_data in epoch_data.get('train_losses', {}).items():
+            group = map_group(task_id_to_name.get(str(task_id), ''))
+            if group is None:
+                continue
+            mean_val = loss_data.get('mean')
+            if mean_val is not None:
+                group_values[group].append(mean_val)
+
+        for group in group_order:
+            if group_values[group]:
+                group_train_losses[group].append(float(np.mean(group_values[group])))
             else:
-                task_train_losses[task_id].append(np.nan)
-    
-    # Plot each task's training loss
-    for idx, task_id in enumerate([1, 2, 3, 4]):
+                group_train_losses[group].append(np.nan)
+
+    # Plot each group's training loss
+    for idx, group in enumerate(group_order):
         ax = axes1[idx // 3, idx % 3]
-        losses = task_train_losses[task_id]
-        ax.plot(epochs[:len(losses)], losses, marker='o', linewidth=2, 
-                color=task_colors[task_id], markersize=4)
+        losses = group_train_losses[group]
+        ax.plot(epochs[:len(losses)], losses, marker='o', linewidth=2,
+                color=task_colors[group], markersize=4)
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Loss')
-        ax.set_title(f'Task {task_id}: {task_names[task_id]} - Train Loss')
+        ax.set_title(f'{group} - Train Loss')
         ax.grid(True, alpha=0.3)
-    
+
     # Plot average training loss
     ax_avg = axes1[1, 1]
-    ax_avg.plot(epochs, summary_df['avg_train_loss'], marker='o', linewidth=2, 
-                color=avg_color, markersize=4, label='Average')
+    avg_train_loss = None
+    if 'avg_train_loss' in summary_df.columns:
+        avg_train_loss = summary_df['avg_train_loss']
+    elif history['epochs']:
+        avg_train_loss = [
+            np.mean([d['mean'] for d in epoch_data['train_losses'].values()])
+            for epoch_data in history['epochs']
+            if epoch_data.get('train_losses')
+        ]
+    if avg_train_loss is not None and len(avg_train_loss) > 0:
+        ax_avg.plot(epochs, avg_train_loss, marker='o', linewidth=2,
+                    color=avg_color, markersize=4, label='Average')
     ax_avg.set_xlabel('Epoch')
     ax_avg.set_ylabel('Loss')
     ax_avg.set_title('Average Training Loss (All Tasks)')
     ax_avg.grid(True, alpha=0.3)
     ax_avg.legend()
-    
-    # Plot all tasks together for comparison
+
+    # Plot all groups together for comparison
     ax_all = axes1[1, 2]
-    for task_id in [1, 2, 3, 4]:
-        losses = task_train_losses[task_id]
-        ax_all.plot(epochs[:len(losses)], losses, marker='o', linewidth=2, 
-                    color=task_colors[task_id], markersize=3, 
-                    label=f'Task {task_id}: {task_names[task_id]}')
-    ax_all.plot(epochs, summary_df['avg_train_loss'], marker='s', linewidth=2.5, 
-                color=avg_color, markersize=4, label='Average', linestyle='--')
+    for group in group_order:
+        losses = group_train_losses[group]
+        ax_all.plot(epochs[:len(losses)], losses, marker='o', linewidth=2,
+                    color=task_colors[group], markersize=3,
+                    label=group)
+    if avg_train_loss is not None and len(avg_train_loss) > 0:
+        ax_all.plot(epochs, avg_train_loss, marker='s', linewidth=2.5,
+                    color=avg_color, markersize=4, label='Average', linestyle='--')
     ax_all.set_xlabel('Epoch')
     ax_all.set_ylabel('Loss')
     ax_all.set_title('All Tasks Training Loss Comparison')
     ax_all.legend(loc='upper right', fontsize=8)
     ax_all.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     train_loss_path = save_path.replace('.png', '_train_loss.png') if save_path else log_dir / 'training_loss_per_task.png'
     plt.savefig(train_loss_path, dpi=300, bbox_inches='tight')
     print(f"Training loss plot saved to: {train_loss_path}")
     plt.close()
-    
+
     # ==================== Figure 2: Validation Metrics ====================
     fig2, axes2 = plt.subplots(2, 3, figsize=(18, 10))
-    fig2.suptitle('Validation Metrics - Per Task & Average', fontsize=16, fontweight='bold')
-    
-    # Extract per-task validation metrics
-    task_val_metrics = {task_id: {'primary': [], 'epochs': []} for task_id in [1, 2, 3, 4]}
-    
-    # Define primary metric for each task type
-    # Task 1: Classification -> Accuracy/F1
-    # Task 2: Segmentation -> Dice/IoU
-    # Task 3: Keypoint -> MAE (lower is better, so we'll use negative or handle separately)
-    # Task 4: Measurement -> MAE
-    
+    fig2.suptitle('Validation Metrics - Per Group & Average', fontsize=16, fontweight='bold')
+
+    # Extract per-group validation metrics
+    group_val_metrics = {group: {'primary': [], 'epochs': []} for group in group_order}
+
     for epoch_data in history['epochs']:
         epoch = epoch_data['epoch']
-        for task_id in [1, 2, 3, 4]:
-            task_key = str(task_id)
-            if task_key in epoch_data['val_metrics']:
-                metrics = epoch_data['val_metrics'][task_key]['metrics']
-                task_val_metrics[task_id]['epochs'].append(epoch)
-                
-                # Get primary metric based on task type
-                if task_id == 1:  # Classification
-                    val = metrics.get('F1-Score') or metrics.get('Accuracy')
-                elif task_id == 2:  # Segmentation
-                    val = metrics.get('Dice') or metrics.get('IoU')
-                elif task_id in [3, 4]:  # Keypoint/Measurement - use negative MAE for consistent plotting
-                    mae = metrics.get('MAE (pixels)') or metrics.get('MAE')
-                    val = mae  # Keep as is, will handle in plotting
-                else:
-                    val = None
-                task_val_metrics[task_id]['primary'].append(val)
-    
-    # Plot each task's validation metric
+        group_values = {group: [] for group in group_order}
+        for task_id, task_data in epoch_data.get('val_metrics', {}).items():
+            task_name = task_data.get('task_name', '')
+            group = map_group(task_name)
+            if group is None:
+                continue
+            metrics = task_data.get('metrics', {})
+
+            if group == 'Classification':
+                val = pick_metric(metrics, ['F1-Score', 'Accuracy'])
+            elif group == 'Segmentation':
+                val = pick_metric(metrics, ['Dice', 'IoU'])
+            elif group == 'Detection':
+                val = pick_metric(metrics, ['IoU'])
+            else:
+                val = pick_metric(metrics, ['MAE (pixels)', 'MAE'])
+
+            if val is not None:
+                group_values[group].append(val)
+
+        for group in group_order:
+            if group_values[group]:
+                group_val_metrics[group]['epochs'].append(epoch)
+                group_val_metrics[group]['primary'].append(float(np.mean(group_values[group])))
+
+    # Plot each group's validation metric
     metric_names = {
-        1: 'F1-Score / Accuracy',
-        2: 'Dice / IoU',
-        3: 'MAE (pixels) ↓',
-        4: 'MAE (pixels) ↓'
+        'Classification': 'F1-Score / Accuracy',
+        'Segmentation': 'Dice',
+        'Detection': 'IoU',
+        'Regression': 'MAE (pixels) (lower is better)'
     }
-    
-    for idx, task_id in enumerate([1, 2, 3, 4]):
+
+    for idx, group in enumerate(group_order):
         ax = axes2[idx // 3, idx % 3]
-        epochs_t = task_val_metrics[task_id]['epochs']
-        values = task_val_metrics[task_id]['primary']
-        
+        epochs_t = group_val_metrics[group]['epochs']
+        values = group_val_metrics[group]['primary']
+
         if epochs_t and values:
-            ax.plot(epochs_t, values, marker='s', linewidth=2, 
-                    color=task_colors[task_id], markersize=4)
+            ax.plot(epochs_t, values, marker='s', linewidth=2,
+                    color=task_colors[group], markersize=4)
         ax.set_xlabel('Epoch')
-        ax.set_ylabel(metric_names[task_id])
-        ax.set_title(f'Task {task_id}: {task_names[task_id]} - Val {metric_names[task_id]}')
+        ax.set_ylabel(metric_names[group])
+        ax.set_title(f'{group} - Val {metric_names[group]}')
         ax.grid(True, alpha=0.3)
-        
+
         # For MAE tasks, indicate lower is better
-        if task_id in [3, 4]:
+        if group == 'Regression':
             ax.invert_yaxis()  # Invert so lower MAE appears higher (better)
-    
+
     # Plot average validation metrics
     ax_avg2 = axes2[1, 1]
     if 'avg_f1_score' in summary_df.columns:
-        ax_avg2.plot(epochs, summary_df['avg_f1_score'], marker='s', linewidth=2, 
+        ax_avg2.plot(epochs, summary_df['avg_f1_score'], marker='s', linewidth=2,
                      label='Avg F1-Score', color='#1f77b4')
     if 'avg_dice' in summary_df.columns:
-        ax_avg2.plot(epochs, summary_df['avg_dice'], marker='^', linewidth=2, 
+        ax_avg2.plot(epochs, summary_df['avg_dice'], marker='^', linewidth=2,
                      label='Avg Dice', color='#ff7f0e')
     if 'avg_accuracy' in summary_df.columns:
-        ax_avg2.plot(epochs, summary_df['avg_accuracy'], marker='o', linewidth=2, 
+        ax_avg2.plot(epochs, summary_df['avg_accuracy'], marker='o', linewidth=2,
                      label='Avg Accuracy', color='#2ca02c')
+    if 'avg_iou' in summary_df.columns:
+        ax_avg2.plot(epochs, summary_df['avg_iou'], marker='D', linewidth=2,
+                     label='Avg IoU', color='#d62728')
+    if 'avg_mae' in summary_df.columns:
+        ax_avg2.plot(epochs, summary_df['avg_mae'], marker='v', linewidth=2,
+                     label='Avg MAE', color='#7f7f7f')
     ax_avg2.set_xlabel('Epoch')
     ax_avg2.set_ylabel('Score')
     ax_avg2.set_title('Average Validation Metrics')
     ax_avg2.legend(loc='lower right', fontsize=8)
     ax_avg2.grid(True, alpha=0.3)
-    
-    # Plot combined view - normalized scores
+
+    # Plot combined view - higher is better
     ax_combined = axes2[1, 2]
-    for task_id in [1, 2]:  # Higher is better tasks
-        epochs_t = task_val_metrics[task_id]['epochs']
-        values = task_val_metrics[task_id]['primary']
+    for group in ['Classification', 'Segmentation', 'Detection']:
+        epochs_t = group_val_metrics[group]['epochs']
+        values = group_val_metrics[group]['primary']
         if epochs_t and values:
-            ax_combined.plot(epochs_t, values, marker='o', linewidth=2, 
-                            color=task_colors[task_id], markersize=3,
-                            label=f'Task {task_id}: {task_names[task_id]}')
+            ax_combined.plot(epochs_t, values, marker='o', linewidth=2,
+                            color=task_colors[group], markersize=3,
+                            label=group)
     ax_combined.set_xlabel('Epoch')
     ax_combined.set_ylabel('Score (higher is better)')
-    ax_combined.set_title('Classification & Segmentation Metrics')
+    ax_combined.set_title('Classification, Segmentation, Detection Metrics')
     ax_combined.legend(loc='lower right', fontsize=8)
     ax_combined.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     val_metrics_path = save_path.replace('.png', '_val_metrics.png') if save_path else log_dir / 'validation_metrics_per_task.png'
     plt.savefig(val_metrics_path, dpi=300, bbox_inches='tight')
     print(f"Validation metrics plot saved to: {val_metrics_path}")
     plt.close()
-    
+
     # ==================== Figure 3: Combined Train & Val Summary ====================
     fig3, axes3 = plt.subplots(2, 2, figsize=(14, 10))
     fig3.suptitle('Training & Validation Summary - All Tasks', fontsize=16, fontweight='bold')
-    
-    # Plot 1: All tasks training loss
+
+    # Plot 1: All groups training loss
     ax1 = axes3[0, 0]
-    for task_id in [1, 2, 3, 4]:
-        losses = task_train_losses[task_id]
-        ax1.plot(epochs[:len(losses)], losses, marker='o', linewidth=1.5, 
-                color=task_colors[task_id], markersize=3, alpha=0.7,
-                label=f'T{task_id}: {task_names[task_id]}')
-    ax1.plot(epochs, summary_df['avg_train_loss'], marker='s', linewidth=2.5, 
-            color=avg_color, markersize=4, label='Average', linestyle='--')
+    for group in group_order:
+        losses = group_train_losses[group]
+        ax1.plot(epochs[:len(losses)], losses, marker='o', linewidth=1.5,
+                color=task_colors[group], markersize=3, alpha=0.7,
+                label=group)
+    if avg_train_loss is not None and len(avg_train_loss) > 0:
+        ax1.plot(epochs, avg_train_loss, marker='s', linewidth=2.5,
+                color=avg_color, markersize=4, label='Average', linestyle='--')
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Training Loss')
     ax1.set_title('Training Loss - All Tasks')
     ax1.legend(loc='upper right', fontsize=7)
     ax1.grid(True, alpha=0.3)
-    
-    # Plot 2: Classification & Segmentation val metrics (higher is better)
+
+    # Plot 2: Classification, Segmentation, Detection val metrics (higher is better)
     ax2 = axes3[0, 1]
-    for task_id in [1, 2]:
-        epochs_t = task_val_metrics[task_id]['epochs']
-        values = task_val_metrics[task_id]['primary']
+    for group in ['Classification', 'Segmentation', 'Detection']:
+        epochs_t = group_val_metrics[group]['epochs']
+        values = group_val_metrics[group]['primary']
         if epochs_t and values:
-            ax2.plot(epochs_t, values, marker='s', linewidth=2, 
-                    color=task_colors[task_id], markersize=4,
-                    label=f'T{task_id}: {task_names[task_id]}')
-    if 'avg_f1_score' in summary_df.columns and 'avg_dice' in summary_df.columns:
-        avg_score = (summary_df['avg_f1_score'].fillna(0) + summary_df['avg_dice'].fillna(0)) / 2
-        ax2.plot(epochs, avg_score, marker='D', linewidth=2, 
-                color=avg_color, markersize=4, linestyle='--', label='Avg (F1+Dice)/2')
+            ax2.plot(epochs_t, values, marker='s', linewidth=2,
+                    color=task_colors[group], markersize=4,
+                    label=group)
+    score_cols = [c for c in ['avg_f1_score', 'avg_accuracy', 'avg_dice', 'avg_iou'] if c in summary_df.columns]
+    if score_cols:
+        avg_score = summary_df[score_cols].mean(axis=1, skipna=True)
+        ax2.plot(epochs, avg_score, marker='D', linewidth=2,
+                color=avg_color, markersize=4, linestyle='--', label='Avg (higher is better)')
     ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Score (↑ better)')
-    ax2.set_title('Validation: Classification & Segmentation')
+    ax2.set_ylabel('Score (higher is better)')
+    ax2.set_title('Validation: Classification, Segmentation, Detection')
     ax2.legend(loc='lower right', fontsize=8)
     ax2.grid(True, alpha=0.3)
-    
-    # Plot 3: Keypoint & Measurement val metrics (lower is better)
+
+    # Plot 3: Regression val metrics (lower is better)
     ax3 = axes3[1, 0]
-    for task_id in [3, 4]:
-        epochs_t = task_val_metrics[task_id]['epochs']
-        values = task_val_metrics[task_id]['primary']
-        if epochs_t and values:
-            ax3.plot(epochs_t, values, marker='s', linewidth=2, 
-                    color=task_colors[task_id], markersize=4,
-                    label=f'T{task_id}: {task_names[task_id]}')
+    epochs_t = group_val_metrics['Regression']['epochs']
+    values = group_val_metrics['Regression']['primary']
+    if epochs_t and values:
+        ax3.plot(epochs_t, values, marker='s', linewidth=2,
+                color=task_colors['Regression'], markersize=4,
+                label='Regression')
     if 'avg_mae' in summary_df.columns:
-        ax3.plot(epochs, summary_df['avg_mae'], marker='D', linewidth=2, 
+        ax3.plot(epochs, summary_df['avg_mae'], marker='D', linewidth=2,
                 color=avg_color, markersize=4, linestyle='--', label='Average MAE')
     ax3.set_xlabel('Epoch')
-    ax3.set_ylabel('MAE (pixels) (↓ better)')
-    ax3.set_title('Validation: Keypoint & Measurement')
+    ax3.set_ylabel('MAE (pixels) (lower is better)')
+    ax3.set_title('Validation: Regression')
     ax3.legend(loc='upper right', fontsize=8)
     ax3.grid(True, alpha=0.3)
-    
+
     # Plot 4: Learning rate & epoch time
     ax4 = axes3[1, 1]
     ax4_twin = ax4.twinx()
-    
-    line1 = ax4.plot(epochs, summary_df['learning_rate'], marker='o', linewidth=2, 
-                     color='#17becf', markersize=3, label='Learning Rate')
-    ax4.set_xlabel('Epoch')
-    ax4.set_ylabel('Learning Rate', color='#17becf')
-    ax4.set_yscale('log')
-    ax4.tick_params(axis='y', labelcolor='#17becf')
-    
+
+    if 'learning_rate' in summary_df.columns:
+        line1 = ax4.plot(epochs, summary_df['learning_rate'], marker='o', linewidth=2,
+                         color='#17becf', markersize=3, label='Learning Rate')
+        ax4.set_xlabel('Epoch')
+        ax4.set_ylabel('Learning Rate', color='#17becf')
+        ax4.set_yscale('log')
+        ax4.tick_params(axis='y', labelcolor='#17becf')
+    else:
+        line1 = []
+
     if 'epoch_time' in summary_df.columns and summary_df['epoch_time'].notna().any():
-        line2 = ax4_twin.plot(epochs, summary_df['epoch_time'], marker='s', linewidth=2, 
+        line2 = ax4_twin.plot(epochs, summary_df['epoch_time'], marker='s', linewidth=2,
                               color='#bcbd22', markersize=3, label='Epoch Time')
         ax4_twin.set_ylabel('Epoch Time (s)', color='#bcbd22')
         ax4_twin.tick_params(axis='y', labelcolor='#bcbd22')
@@ -754,22 +860,21 @@ def plot_comprehensive_training_curves(log_dir, save_path=None):
         ax4.legend(lines, labels, loc='upper right', fontsize=8)
     else:
         ax4.legend(loc='upper right', fontsize=8)
-    
+
     ax4.set_title('Learning Rate & Training Time')
     ax4.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     summary_path = save_path if save_path else log_dir / 'training_summary_comprehensive.png'
     plt.savefig(summary_path, dpi=300, bbox_inches='tight')
     print(f"Comprehensive summary plot saved to: {summary_path}")
     plt.close()
-    
+
     print(f"\n{'='*60}")
     print("Generated plots:")
     print(f"  1. {train_loss_path}")
     print(f"  2. {val_metrics_path}")
     print(f"  3. {summary_path}")
     print(f"{'='*60}\n")
-
 
 __all__ = ['TrainingLogger', 'load_training_history', 'plot_training_curves', 'plot_comprehensive_training_curves']

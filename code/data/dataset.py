@@ -138,10 +138,11 @@ class MultiTaskDataset(Dataset):
 
 
 class MultiTaskUniformSampler(Sampler[List[int]]):
-    def __init__(self, dataset: MultiTaskDataset, batch_size: int, steps_per_epoch: Optional[int] = None):
+    def __init__(self, dataset: MultiTaskDataset, batch_size: int, steps_per_epoch: Optional[int] = None, seed: Optional[int] = None):
         self.dataset = dataset
         self.batch_size = batch_size
         self.indices_by_task = {}
+        self.rng = random.Random(seed)
 
         # Group indices by task_id
         print("\n--- Initializing Sampler ---")
@@ -154,7 +155,7 @@ class MultiTaskUniformSampler(Sampler[List[int]]):
         
         # Initial shuffle
         for task_id in self.task_ids:
-            random.shuffle(self.indices_by_task[task_id])
+            self.rng.shuffle(self.indices_by_task[task_id])
 
         # Determine epoch length
         if steps_per_epoch is None:
@@ -167,7 +168,7 @@ class MultiTaskUniformSampler(Sampler[List[int]]):
 
         for _ in range(self.steps_per_epoch):
             # Randomly select a task
-            task_id = random.choice(self.task_ids)
+            task_id = self.rng.choice(self.task_ids)
             indices = self.indices_by_task[task_id]
             cursor = task_cursors[task_id]
             
@@ -177,7 +178,7 @@ class MultiTaskUniformSampler(Sampler[List[int]]):
             if end_idx > len(indices):
                 # Wrap around
                 batch_indices = indices[start_idx:]
-                random.shuffle(indices)
+                self.rng.shuffle(indices)
                 remaining = self.batch_size - len(batch_indices)
                 batch_indices.extend(indices[:remaining])
                 task_cursors[task_id] = remaining

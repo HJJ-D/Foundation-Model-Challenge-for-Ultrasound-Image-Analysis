@@ -1,9 +1,9 @@
 """Loss functions for multi-task learning."""
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 import segmentation_models_pytorch.losses as smp_losses
 
 
@@ -39,14 +39,54 @@ class DetectionLoss(nn.Module):
             target_objectness
         )
         
-        # Smooth L1 for bbox regression
-        box_loss = F.smooth_l1_loss(
-            pred_bbox,
-            target_bbox
-        )
+        # Smooth L1 for bbox regression (only for positive samples)
+        pos_mask = target_objectness > 0.5
+        if pos_mask.any():
+            box_loss = F.smooth_l1_loss(
+                pred_bbox[pos_mask],
+                target_bbox[pos_mask]
+            )
+        else:
+            box_loss = pred_bbox.new_tensor(0.0)
         
         total_loss = self.cls_w * cls_loss + self.box_w * box_loss
         return total_loss
+
+
+class CenterNetLoss(nn.Module):
+    """CenterNet-style loss for heatmap + size + offset."""
+
+    def __init__(self, heatmap_alpha=2.0, heatmap_gamma=4.0, size_weight=1.0, offset_weight=1.0):
+        super().__init__()
+        self.heatmap_loss = FocalLoss(alpha=heatmap_alpha, gamma=heatmap_gamma)
+        self.size_weight = size_weight
+        self.offset_weight = offset_weight
+
+    def forward(self, predictions, targets):
+        """
+        Args:
+            predictions: dict with heatmap [B,1,H,W], size [B,2,H,W], offset [B,2,H,W]
+            targets: dict with heatmap, size, offset, mask [B,1,H,W]
+        """
+        pred_heatmap = predictions['heatmap']
+        pred_size = predictions['size']
+        pred_offset = predictions['offset']
+
+        tgt_heatmap = targets['heatmap']
+        tgt_size = targets['size']
+        tgt_offset = targets['offset']
+        mask = targets['mask']
+
+        heatmap_loss = self.heatmap_loss(pred_heatmap, tgt_heatmap)
+
+        if mask.sum() > 0:
+            size_loss = F.l1_loss(pred_size * mask, tgt_size * mask, reduction='sum') / (mask.sum() + 1e-6)
+            offset_loss = F.l1_loss(pred_offset * mask, tgt_offset * mask, reduction='sum') / (mask.sum() + 1e-6)
+        else:
+            size_loss = pred_size.new_tensor(0.0)
+            offset_loss = pred_offset.new_tensor(0.0)
+
+        return heatmap_loss + self.size_weight * size_loss + self.offset_weight * offset_loss
 
 
 class FocalLoss(nn.Module):
@@ -97,12 +137,21 @@ def build_loss_function(task_name, loss_config):
         loss_fn = nn.CrossEntropyLoss()
     
     elif task_name == 'detection':
-        cls_weight = loss_config.get('classification_weight', 2.0)
-        box_weight = loss_config.get('box_regression_weight', 1.0)
-        loss_fn = DetectionLoss(
-            classification_weight=cls_weight,
-            box_regression_weight=box_weight
-        )
+        loss_type = loss_config.get('type', 'CenterNet')
+        if loss_type.lower() == 'centernet':
+            loss_fn = CenterNetLoss(
+                heatmap_alpha=loss_config.get('heatmap_alpha', 2.0),
+                heatmap_gamma=loss_config.get('heatmap_gamma', 4.0),
+                size_weight=loss_config.get('size_weight', 1.0),
+                offset_weight=loss_config.get('offset_weight', 1.0)
+            )
+        else:
+            cls_weight = loss_config.get('classification_weight', 2.0)
+            box_weight = loss_config.get('box_regression_weight', 1.0)
+            loss_fn = DetectionLoss(
+                classification_weight=cls_weight,
+                box_regression_weight=box_weight
+            )
     
     elif task_name == 'Regression':
         if loss_type == 'L1Loss':
@@ -152,11 +201,6 @@ class AdaptiveLossWeighter(nn.Module):
         """
         Compute weighted loss with uncertainty.
         
-        Args:
-            losses_dict: Dictionary mapping task_name to loss value (tensor)
-        
-        Returns:
-            total_loss: Weighted sum of losses with regularization
             weighted_losses: Dictionary of weighted losses for logging
             task_weights: Dictionary of computed weights for logging
         """
@@ -167,24 +211,22 @@ class AdaptiveLossWeighter(nn.Module):
         for task_name, loss in losses_dict.items():
             if task_name not in self.log_vars:
                 # If task not in log_vars (shouldn't happen), use weight=1.0
+                if loss.ndim != 0:
+                    loss = loss.mean()
                 weighted_loss = loss
                 task_weights[task_name] = 1.0
             else:
-                log_var = self.log_vars[task_name]
+                log_var = self._stable_log_var(self.log_vars[task_name])
                 
-                # Clamp log_var to prevent extreme values
-                # log_var ∈ [-5, 5] → sigma ∈ [0.08, 12.18] → weight ∈ [0.003, 30.1]
-                # Wider range allows more flexibility in uncertainty estimation
-                log_var_clamped = torch.clamp(log_var, min=-5.0, max=5.0)
+                # Compute precision (inverse variance): 1 / (2 * sigma^2) = exp(-log_var) / 2
+                precision = torch.exp(-log_var)
                 
-                # Compute precision (inverse variance): 1 / sigma^2 = exp(-log_var)
-                precision = torch.exp(-log_var_clamped)
-                
-                # Weighted loss formula from Kendall et al. (CVPR 2018):
-                # L_total = (1 / (2 * sigma^2)) * L_task + log(sigma)
-                # = 0.5 * precision * L_task + 0.5 * log_var
-                weighted_loss = 0.5 * precision * loss + 0.5 * log_var_clamped
-                
+                # Weighted loss: (1 / (2 * sigma^2)) * loss + log(sigma)
+                # = (exp(-log_var) / 2) * loss + 0.5 * log_var
+                if loss.ndim != 0:
+                    loss = loss.mean()
+                weighted_loss = 0.5 * precision * loss + 0.5 * log_var
+
                 task_weights[task_name] = (0.5 * precision).item()
             
             weighted_losses[task_name] = weighted_loss
@@ -196,9 +238,8 @@ class AdaptiveLossWeighter(nn.Module):
         """Get current task weights as a dictionary."""
         weights = {}
         for task_name, log_var in self.log_vars.items():
-            # Apply same clamping as in forward pass for consistency
-            log_var_clamped = torch.clamp(log_var, min=-5.0, max=5.0)
-            precision = torch.exp(-log_var_clamped)
+            log_var = self._stable_log_var(log_var)
+            precision = torch.exp(-log_var)
             weights[task_name] = (0.5 * precision).item()
         return weights
     
@@ -206,11 +247,16 @@ class AdaptiveLossWeighter(nn.Module):
         """Get current sigma values (uncertainty) as a dictionary."""
         sigmas = {}
         for task_name, log_var in self.log_vars.items():
-            # Apply same clamping as in forward pass for consistency
-            log_var_clamped = torch.clamp(log_var, min=-5.0, max=5.0)
-            sigma = torch.exp(0.5 * log_var_clamped)
+            log_var = self._stable_log_var(log_var)
+            sigma = torch.exp(0.5 * log_var)
             sigmas[task_name] = sigma.item()
         return sigmas
+
+    @staticmethod
+    def _stable_log_var(log_var):
+        # Smoothly bound log_var to avoid zero gradients at hard clamp limits.
+        # Range: [-3, 3] -> sigma in [0.22, 4.48].
+        return 3.0 * torch.tanh(log_var / 3.0)
 
 
 def build_all_losses(config):

@@ -23,6 +23,7 @@ from models import build_model
 from losses import build_all_losses
 from data import MultiTaskDataset, MultiTaskUniformSampler
 from utils import set_seed, multi_task_collate_fn
+from utils.common import gaussian_radius, draw_gaussian
 from utils.logger import TrainingLogger
 from metrics import evaluate
 
@@ -71,9 +72,41 @@ def build_dataloaders(config):
             task_config_map[task_id] = task_config
             task_configs.append(task_config)
     
+    # Optional single-task training filter
+    single_task_cfg = config.get('training.single_task', {}) or {}
+    if single_task_cfg.get('enabled', False):
+        single_task_id = single_task_cfg.get('task_id')
+        single_task_name = single_task_cfg.get('task_name')
+        if single_task_id and single_task_name:
+            raise ValueError("Set only one of training.single_task.task_id or task_name, not both.")
+        if not single_task_id and not single_task_name:
+            raise ValueError("training.single_task.task_id or task_name must be set when single-task mode is enabled.")
+        if single_task_id:
+            if single_task_id not in task_config_map:
+                available = ", ".join(sorted(task_config_map.keys()))
+                raise ValueError(f"Unknown task_id '{single_task_id}'. Available task_ids: {available}")
+            task_configs = [task_config_map[single_task_id]]
+            full_dataset.dataframe = full_dataset.dataframe[
+                full_dataset.dataframe['task_id'] == single_task_id
+            ].reset_index(drop=True)
+            print(f"Single-task mode enabled by task_id: {single_task_id}")
+        else:
+            matching = [
+                cfg for cfg in task_configs
+                if str(cfg.get('task_name', '')).lower() == str(single_task_name).lower()
+            ]
+            if not matching:
+                available_names = sorted({cfg['task_name'] for cfg in task_configs})
+                raise ValueError(f"Unknown task_name '{single_task_name}'. Available task_names: {available_names}")
+            task_configs = matching
+            full_dataset.dataframe = full_dataset.dataframe[
+                full_dataset.dataframe['task_name'].str.lower() == str(single_task_name).lower()
+            ].reset_index(drop=True)
+            print(f"Single-task mode enabled by task_name: {single_task_name}")
+
     # Update config with dynamic task_configs
     config.config['tasks'] = task_configs
-    
+
     print(f"Detected {len(task_configs)} tasks:")
     for cfg in sorted(task_configs, key=lambda x: x['task_id']):
         print(f"  - {cfg['task_id']}: {cfg['task_name']}, num_classes={cfg['num_classes']}")
@@ -114,7 +147,8 @@ def build_dataloaders(config):
     train_sampler = MultiTaskUniformSampler(
         dataset=train_dataset,
         batch_size=config.batch_size,
-        steps_per_epoch=config.get('training.steps_per_epoch')
+        steps_per_epoch=config.get('training.steps_per_epoch'),
+        seed=config.seed
     )
     
     # Create dataloaders
@@ -288,21 +322,63 @@ def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, de
             loss = loss + aux_loss
         
         elif task_name == 'detection':
-            # Extract prediction at GT center grid
-            B, C, H, W = outputs.shape
-            gt_center_x = (labels[:, 0] + labels[:, 2]) / 2.0
-            gt_center_y = (labels[:, 1] + labels[:, 3]) / 2.0
-            coord_h = torch.clamp((gt_center_y * H).long(), 0, H - 1)
-            coord_w = torch.clamp((gt_center_x * W).long(), 0, W - 1)
-            
-            final_outputs = torch.zeros((B, 5), device=device)
-            for i in range(B):
-                final_outputs[i] = outputs[i, :, coord_h[i], coord_w[i]]
-            
-            # Create target: [bbox(4), objectness(1)]
-            targets = torch.cat([labels, torch.ones((B, 1), device=device)], dim=1)
-            
-            loss = loss_functions[task_name](final_outputs, targets)
+            if isinstance(outputs, dict) and 'heatmap' in outputs:
+                # CenterNet-style targets
+                heatmap = outputs['heatmap']
+                size = outputs['size']
+                offset = outputs['offset']
+                B, _, H, W = heatmap.shape
+
+                target_heatmap = torch.zeros_like(heatmap)
+                target_size = torch.zeros_like(size)
+                target_offset = torch.zeros_like(offset)
+                target_mask = torch.zeros((B, 1, H, W), device=device)
+
+                valid_mask = (labels >= 0).all(dim=1)
+                for i in range(B):
+                    if not valid_mask[i]:
+                        continue
+                    x1, y1, x2, y2 = labels[i]
+                    cx = (x1 + x2) * 0.5
+                    cy = (y1 + y2) * 0.5
+                    gw = torch.clamp((cx * W).long(), 0, W - 1)
+                    gh = torch.clamp((cy * H).long(), 0, H - 1)
+                    target_size[i, 0, gh, gw] = (x2 - x1)
+                    target_size[i, 1, gh, gw] = (y2 - y1)
+                    target_offset[i, 0, gh, gw] = cx * W - gw.float()
+                    target_offset[i, 1, gh, gw] = cy * H - gh.float()
+                    target_mask[i, 0, gh, gw] = 1.0
+                    box_h = (y2 - y1) * H
+                    box_w = (x2 - x1) * W
+                    radius = int(max(1, gaussian_radius((box_h.item(), box_w.item()))))
+                    draw_gaussian(target_heatmap[i, 0], (int(gw.item()), int(gh.item())), radius)
+
+                targets = {
+                    'heatmap': target_heatmap,
+                    'size': target_size,
+                    'offset': target_offset,
+                    'mask': target_mask
+                }
+                loss = loss_functions[task_name](outputs, targets)
+            else:
+                # Extract prediction at GT center grid
+                B, C, H, W = outputs.shape
+                gt_center_x = (labels[:, 0] + labels[:, 2]) / 2.0
+                gt_center_y = (labels[:, 1] + labels[:, 3]) / 2.0
+                coord_h = torch.clamp((gt_center_y * H).long(), 0, H - 1)
+                coord_w = torch.clamp((gt_center_x * W).long(), 0, W - 1)
+                
+                final_outputs = torch.zeros((B, 5), device=device)
+                for i in range(B):
+                    final_outputs[i] = outputs[i, :, coord_h[i], coord_w[i]]
+                
+                # Create target: [bbox(4), objectness(1)]
+                valid_mask = (labels >= 0).all(dim=1)
+                labels_clean = labels.clone()
+                labels_clean[~valid_mask] = 0.0
+                targets = torch.cat([labels_clean, valid_mask.float().unsqueeze(1)], dim=1)
+                
+                loss = loss_functions[task_name](final_outputs, targets)
         
         else:
             loss = loss_functions[task_name](outputs, labels)
@@ -385,6 +461,8 @@ def main(config_path=None):
     
     # Build losses
     loss_functions, loss_weights = build_all_losses(config)
+    if isinstance(loss_weights, nn.Module):
+        loss_weights = loss_weights.to(config.device)
     
     # Build optimizer and scheduler (pass loss_weights for adaptive loss support)
     optimizer = build_optimizer(model, config, loss_weighter=loss_weights)
@@ -397,6 +475,7 @@ def main(config_path=None):
     # Initialize best validation score for model saving
     best_val_score = -float('inf')
     best_epoch = 0
+    best_model_eval_on_train = None
     best_model_path = logger.get_experiment_dir() / 'best_model.pth'
     
     # Training loop
@@ -499,13 +578,13 @@ def main(config_path=None):
             adaptive_weights=adaptive_weights
         )
         
-        # Save best model
+        # Save best model and best model summary
         if avg_val_score > best_val_score:
             best_val_score = avg_val_score
             best_epoch = epoch + 1
             torch.save(model.state_dict(), best_model_path)
-            logger._save_val_summary_txt()
-        
+            # Defer best-model training evaluation to the end of training
+                     
         # Step scheduler
         if scheduler is not None:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -540,6 +619,47 @@ def main(config_path=None):
     
     # Save final summary
     logger.save_final_summary(best_epoch=best_epoch, best_score=best_val_score)
+
+    # Evaluate best model on training set at the end
+    if best_model_path.exists():
+        model.load_state_dict(torch.load(best_model_path, map_location=config.device))
+        train_eval_df = evaluate(model, train_loader, config.device, config.get_task_configs())
+
+        # Calculate average scores for each task group
+        best_model_eval_on_train = {}
+        task_groups = {
+           "classification": ["Accuracy", "F1-Score"],  # Include both Accuracy and F1-Score for classification
+           "segmentation": ["Dice"],
+           "detection": ["IoU"],
+           "regression": ["MAE (pixels)"]
+        }
+
+        for group_name, metrics in task_groups.items():
+           group_scores = {metric: [] for metric in metrics}  # Separate scores for each metric
+           for _, row in train_eval_df.iterrows():
+                 for metric in metrics:
+                    if metric in row and pd.notna(row[metric]):
+                       group_scores[metric].append(row[metric])
+
+           # Calculate mean for each metric
+           group_means = {
+               metric: np.mean(scores) if scores else None
+               for metric, scores in group_scores.items()
+           }
+
+           # Store results
+           if group_name == "classification":
+               # Special handling for classification to store multiple metrics
+               best_model_eval_on_train[group_name] = {
+                   "Accuracy": group_means.get("Accuracy"),
+                   "F1-Score": group_means.get("F1-Score")
+               }
+           else:
+               # For other groups, store the first available metric
+               best_model_eval_on_train[group_name] = next((v for v in group_means.values() if v is not None), None)
+
+    # Save best model summary at the end of training
+    logger._save_best_model_summary_txt(best_model_eval_on_train)
     
     print(f"\n{'='*80}")
     print("Training Complete!")
@@ -550,8 +670,9 @@ def main(config_path=None):
     
     # Generate training curves plot
     try:
-        from utils.logger import plot_training_curves
+        from utils.logger import plot_training_curves, plot_comprehensive_training_curves
         plot_training_curves(logger.get_experiment_dir())
+        plot_comprehensive_training_curves(logger.get_experiment_dir())
         print("Training curves plot generated successfully.")
     except Exception as e:
         print(f"Could not generate training curves plot: {e}")
