@@ -58,7 +58,7 @@ class CenterNetLoss(nn.Module):
 
     def __init__(self, heatmap_alpha=2.0, heatmap_gamma=4.0, size_weight=1.0, offset_weight=1.0):
         super().__init__()
-        self.heatmap_loss = FocalLoss(alpha=heatmap_alpha, gamma=heatmap_gamma)
+        self.heatmap_loss = CenterNetFocalLoss(alpha=heatmap_alpha, beta=heatmap_gamma)
         self.size_weight = size_weight
         self.offset_weight = offset_weight
 
@@ -68,6 +68,16 @@ class CenterNetLoss(nn.Module):
             predictions: dict with heatmap [B,1,H,W], size [B,2,H,W], offset [B,2,H,W]
             targets: dict with heatmap, size, offset, mask [B,1,H,W]
         """
+        # Check if predictions is a dict (CenterNet format) or tensor (simple detection format)
+        if not isinstance(predictions, dict):
+            raise TypeError(
+                f"CenterNetLoss expects dict input with keys ['heatmap', 'size', 'offset'], "
+                f"but got {type(predictions).__name__}. "
+                f"This likely means your model is using DetectionHead (returns tensor) "
+                f"but your loss is configured as CenterNet. "
+                f"Fix: Set loss.type='Detection' in config, or set detection.head.type='centernet' in config."
+            )
+        
         pred_heatmap = predictions['heatmap']
         pred_size = predictions['size']
         pred_offset = predictions['offset']
@@ -111,6 +121,35 @@ class FocalLoss(nn.Module):
             return F_loss
 
 
+class CenterNetFocalLoss(nn.Module):
+    """
+    Modified focal loss used in CenterNet.
+    """
+
+    def __init__(self, alpha=2.0, beta=4.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+
+    def forward(self, inputs, targets):
+        pred = torch.sigmoid(inputs).clamp(1e-6, 1 - 1e-6)
+        pos_mask = targets.eq(1).float()
+        neg_mask = targets.lt(1).float()
+
+        neg_weights = torch.pow(1 - targets, self.beta)
+
+        pos_loss = -torch.log(pred) * torch.pow(1 - pred, self.alpha) * pos_mask
+        neg_loss = -torch.log(1 - pred) * torch.pow(pred, self.alpha) * neg_weights * neg_mask
+
+        num_pos = pos_mask.sum()
+        pos_loss = pos_loss.sum()
+        neg_loss = neg_loss.sum()
+
+        if num_pos > 0:
+            return (pos_loss + neg_loss) / num_pos
+        return neg_loss
+
+
 def build_loss_function(task_name, loss_config):
     """
     Build loss function from configuration.
@@ -140,14 +179,14 @@ def build_loss_function(task_name, loss_config):
         loss_type = loss_config.get('type', 'CenterNet')
         if loss_type.lower() == 'centernet':
             loss_fn = CenterNetLoss(
-                heatmap_alpha=loss_config.get('heatmap_alpha', 2.0),
-                heatmap_gamma=loss_config.get('heatmap_gamma', 4.0),
-                size_weight=loss_config.get('size_weight', 1.0),
-                offset_weight=loss_config.get('offset_weight', 1.0)
+                heatmap_alpha=float(loss_config.get('heatmap_alpha', 2.0)),
+                heatmap_gamma=float(loss_config.get('heatmap_gamma', 4.0)),
+                size_weight=float(loss_config.get('size_weight', 1.0)),
+                offset_weight=float(loss_config.get('offset_weight', 1.0))
             )
         else:
-            cls_weight = loss_config.get('classification_weight', 2.0)
-            box_weight = loss_config.get('box_regression_weight', 1.0)
+            cls_weight = float(loss_config.get('classification_weight', 2.0))
+            box_weight = float(loss_config.get('box_regression_weight', 1.0))
             loss_fn = DetectionLoss(
                 classification_weight=cls_weight,
                 box_regression_weight=box_weight
@@ -292,7 +331,7 @@ def build_all_losses(config):
         
         if init_log_vars_per_task:
             # Use per-task initialization
-            init_log_vars = [init_log_vars_per_task.get(task_name, 0.0) for task_name in task_names]
+            init_log_vars = [float(init_log_vars_per_task.get(task_name, 0.0)) for task_name in task_names]
             print(f"✓ Built {len(loss_functions)} loss functions with Adaptive Loss Weighting (per-task init):")
             for task_name, init_val in zip(task_names, init_log_vars):
                 sigma = np.exp(0.5 * init_val)
@@ -300,7 +339,7 @@ def build_all_losses(config):
                 print(f"  - {task_name}: init_log_var={init_val:.2f}, sigma={sigma:.2f}, weight={weight:.2f}")
         else:
             # Use same initialization for all tasks
-            init_log_vars = config.get('training.adaptive_loss.init_log_vars', 0.0)
+            init_log_vars = float(config.get('training.adaptive_loss.init_log_vars', 0.0))
             sigma = np.exp(0.5 * init_log_vars)
             weight = 0.5 * np.exp(-init_log_vars)
             print(f"✓ Built {len(loss_functions)} loss functions with Adaptive Loss Weighting:")
@@ -313,6 +352,8 @@ def build_all_losses(config):
         return loss_functions, loss_weighter
     else:
         loss_weights = config.get('training.loss_weights', {})
+        # Convert loss weights to float
+        loss_weights = {k: float(v) for k, v in loss_weights.items()}
         
         print(f"✓ Built {len(loss_functions)} loss functions:")
         for task_name, loss_fn in loss_functions.items():

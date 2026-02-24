@@ -5,6 +5,7 @@ import torch.nn as nn
 from .encoders import build_encoder
 from .decoders import build_decoders
 from .heads import build_all_heads
+from .moe import MoEConvBlock
 from .film_layer import TaskFiLMGenerator, TaskEmbeddingFiLMGenerator, FiLMLayer
 
 
@@ -27,7 +28,8 @@ class MultiTaskModel(nn.Module):
         self.task_configs = config.get_task_configs()
         
         # Build encoder
-        self.encoder = build_encoder(config)
+        task_ids = [cfg['task_id'] for cfg in self.task_configs]
+        self.encoder = build_encoder(config, task_ids=task_ids)
         
         # Get encoder output channels
         if hasattr(self.encoder, 'out_channels'):
@@ -54,7 +56,7 @@ class MultiTaskModel(nn.Module):
             task_ids = [cfg['task_id'] for cfg in self.task_configs]
             film_config = config.get('model.film', {})
             use_embedding = film_config.get('use_task_embedding', False)
-            embedding_dim = film_config.get('embedding_dim', 64)
+            embedding_dim = int(film_config.get('embedding_dim', 64))
             use_affine = film_config.get('use_affine', True)
             
             if use_embedding:
@@ -77,6 +79,43 @@ class MultiTaskModel(nn.Module):
                 num_features=self.fpn_out_channels,
                 use_affine=use_affine
             )
+
+        # Build MoE blocks (optional)
+        moe_cfg = config.get('model.moe', {}) or {}
+        self.use_moe = moe_cfg.get('enabled', False) and not getattr(self.encoder, "handles_moe", False)
+        self.moe_stage_indices = moe_cfg.get('stage_indices', None)
+        self._moe_warned = False
+        if self.use_moe:
+            task_ids = [cfg['task_id'] for cfg in self.task_configs]
+            num_experts = int(moe_cfg.get('num_experts', 4))
+            expert_hidden = int(moe_cfg.get('expert_hidden')) if moe_cfg.get('expert_hidden') is not None else None
+            router_hidden = int(moe_cfg.get('router_hidden')) if moe_cfg.get('router_hidden') is not None else None
+            top_k = int(moe_cfg.get('top_k', 1))
+            use_task_embedding = moe_cfg.get('use_task_embedding', True)
+            task_embedding_dim = int(moe_cfg.get('task_embedding_dim', 32))
+            use_residual = moe_cfg.get('use_residual', True)
+            dropout = float(moe_cfg.get('dropout', 0.0))
+
+            moe_channels = list(encoder_channels)
+            if getattr(self.encoder, "is_timm_encoder", False) and len(moe_channels) > 1:
+                moe_channels = moe_channels[1:]
+
+            self.moe_blocks = nn.ModuleList([
+                MoEConvBlock(
+                    in_channels=ch,
+                    num_experts=num_experts,
+                    expert_hidden=expert_hidden,
+                    router_hidden=router_hidden,
+                    top_k=top_k,
+                    use_task_embedding=use_task_embedding,
+                    task_embedding_dim=task_embedding_dim,
+                    task_ids=task_ids,
+                    use_residual=use_residual,
+                    dropout=dropout,
+                )
+                for ch in moe_channels
+            ])
+            print(f"✓ Using MoE on {len(self.moe_blocks)} encoder stages (experts={num_experts}, top_k={top_k})")
         
         # Build task-specific heads
         model_config = config.config.get('model', {})
@@ -122,7 +161,12 @@ class MultiTaskModel(nn.Module):
         task_name = self.task_id_to_name[task_id]
         
         # Encode features
-        features = self.encoder(x)
+        if getattr(self.encoder, "supports_task_id", False):
+            features = self.encoder(x, task_id)
+        else:
+            features = self.encoder(x)
+        if self.use_moe:
+            features = self._apply_moe(features, task_id)
         
         # Route through appropriate decoder and head
         if task_name == 'segmentation':
@@ -166,6 +210,36 @@ class MultiTaskModel(nn.Module):
                 output = self.heads[task_id](features)
         
         return output
+
+    def _apply_moe(self, features, task_id):
+        if len(features) == len(self.moe_blocks):
+            out = []
+            for idx, (feat, moe) in enumerate(zip(features, self.moe_blocks)):
+                if self.moe_stage_indices is None or idx in self.moe_stage_indices:
+                    out.append(moe(feat, task_id))
+                else:
+                    out.append(feat)
+            return out
+
+        if len(features) == len(self.moe_blocks) + 1:
+            out = [features[0]]
+            for local_idx, (feat, moe) in enumerate(zip(features[1:], self.moe_blocks)):
+                idx = local_idx + 1
+                if self.moe_stage_indices is None or idx in self.moe_stage_indices:
+                    out.append(moe(feat, task_id))
+                else:
+                    out.append(feat)
+            return out
+
+        # Fallback: apply MoE to as many stages as possible.
+        if not self._moe_warned:
+            print("Warning: MoE stage count does not match encoder features, applying to min length.")
+            self._moe_warned = True
+        out = list(features)
+        for idx in range(min(len(features), len(self.moe_blocks))):
+            if self.moe_stage_indices is None or idx in self.moe_stage_indices:
+                out[idx] = self.moe_blocks[idx](features[idx], task_id)
+        return out
     
     def get_trainable_parameters(self):
         """
@@ -192,6 +266,29 @@ class MultiTaskModel(nn.Module):
         head_params += list(self.heads.parameters())
         
         return encoder_params, head_params
+
+    def get_moe_aux_loss(self):
+        device = next(self.parameters()).device
+        total = torch.tensor(0.0, device=device)
+        if hasattr(self.encoder, "get_moe_aux_loss"):
+            total = total + self.encoder.get_moe_aux_loss()
+        if self.use_moe:
+            for block in self.moe_blocks:
+                aux = getattr(block, "last_aux_loss", None)
+                if aux is not None:
+                    total = total + aux
+        return total
+
+    def get_moe_stats(self):
+        stats = []
+        if hasattr(self.encoder, "get_moe_stats"):
+            stats.extend(self.encoder.get_moe_stats())
+        if self.use_moe:
+            for block in self.moe_blocks:
+                block_stats = block.get_stats()
+                if block_stats is not None:
+                    stats.append(block_stats)
+        return stats
     
     def freeze_encoder(self):
         """Freeze encoder parameters."""

@@ -2,10 +2,10 @@
 
 # Experiment settings
 experiment:
-  name: "DINOv3_spm_interaction"
+  name: "MoE_AdaptiveLoss_film_multitask"
   seed: 42
-  output_dir: "outputs/DINOv3_spm_interaction"
-  save_checkpoints: false
+  output_dir: "outputs"
+  save_checkpoints: true
   checkpoint_freq: 10  # Save every N epochs
 
 # Data settings
@@ -28,13 +28,13 @@ data:
       vertical_flip: 0.0
     
     normalize:
-      mean: [0.330189, 0.330189, 0.330189]
-      std: [0.178211, 0.178211, 0.178211]
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
 
 # Model architecture
 model:
   moe:
-    enabled: false
+    enabled: true
     num_experts: 16
     top_k: 2
     stage_indices: [2, 3]
@@ -50,35 +50,24 @@ model:
 
   # Encoder settings
   encoder:
-    name: "dinov3"  # swin_*, dinov3, or timm:<model_name>
-    timm_name: "vit_large_patch16_dinov3.lvd1689m"  # replace with a valid timm DINOv3 model in your environment
-    out_indices: [5, 11, 17, 23]  # DINOv3 intermediate blocks used by adapter
-    freeze_dino: true  # freeze DINO backbone only
-    adapter_channels: 256  # backward-compatible fallback
-    adapter:
-      type: "spm_interaction"  # "resize" (old path) or "spm_interaction" (CNN pyramid + deformable cross-attn)
-      channels: 256
-      spm_stem_channels: 64
-      interaction_heads: 8
-      interaction_points: 4
-      interaction_offset_range: 0.25
+    name: "swin_b"  # swin_t, swin_s, swin_b, or any timm/smp model
     pretrained: "imagenet"
-    freeze_encoder: false  # true will freeze the whole encoder (including SPM/interaction)
+    freeze_encoder: false
   
   # Decoder settings
   decoder:
     type: "fpn"  # Feature Pyramid Network
     pyramid_channels: 256
-    segmentation_channels: 256
-    dropout: 0.1
+    segmentation_channels: 128
+    dropout: 0.2
     merge_policy: "cat"
     
     # Use separate FPN for detection (avoid conflict with segmentation)
     separate_detection_fpn: true
     separate_classification_fpn: true
     separate_regression_fpn: true
-    use_fpn_for_classification: false
-    use_fpn_for_regression: false
+    use_fpn_for_classification: true
+    use_fpn_for_regression: true
   
   # FiLM (Feature-wise Linear Modulation) settings
   use_film: true 
@@ -118,7 +107,7 @@ model:
 
 # Training settings
 training:
-  num_epochs: 50
+  num_epochs: 100
 
   # Single-task training (optional)
   single_task:
@@ -140,7 +129,7 @@ training:
   # Learning rate scheduler
   scheduler:
     type: "CosineAnnealingLR"  # CosineAnnealingLR, ReduceLROnPlateau, StepLR
-    T_max: 50  # For CosineAnnealingLR
+    T_max: 100  # For CosineAnnealingLR
     eta_min: 1.0e-6
     
     # For ReduceLROnPlateau
@@ -156,15 +145,15 @@ training:
   loss_weights:
     segmentation: 1.0
     classification: 1.0
-    detection: 2.0
+    detection: 1.0
     regression: 1.0
   
   # Adaptive loss weighting (uncertainty-based)
   adaptive_loss:
-    enabled: false  # Set to true to enable adaptive loss weighting
+    enabled: true  # Set to true to enable adaptive loss weighting
     init_log_vars: -1.0
     learning_rate: 1.0e-4
-    warmup_epochs: 15
+    warmup_epochs: 3
   
   # Task-specific loss settings
   loss_configs:

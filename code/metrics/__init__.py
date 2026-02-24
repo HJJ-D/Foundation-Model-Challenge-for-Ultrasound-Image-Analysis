@@ -138,8 +138,8 @@ def evaluate(model, val_loader, device, task_configs):
                             off_y = offset[i, 1, best_h[i], best_w[i]]
                             cx = (best_w[i].float() + off_x) / w
                             cy = (best_h[i].float() + off_y) / h
-                            box_w = size[i, 0, best_h[i], best_w[i]]
-                            box_h = size[i, 1, best_h[i], best_w[i]]
+                            box_w = size[i, 0, best_h[i], best_w[i]] / w
+                            box_h = size[i, 1, best_h[i], best_w[i]] / h
                             x1 = cx - box_w * 0.5
                             y1 = cy - box_h * 0.5
                             x2 = cx + box_w * 0.5

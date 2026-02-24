@@ -6,6 +6,13 @@ import torch.nn.functional as F
 import segmentation_models_pytorch as smp
 
 
+def _gn_groups(channels):
+    groups = min(32, channels)
+    while channels % groups != 0:
+        groups -= 1
+    return groups
+
+
 class SegmentationHead(nn.Module):
     """Standard segmentation head with a deeper pre-head stack."""
 
@@ -13,12 +20,6 @@ class SegmentationHead(nn.Module):
         super().__init__()
         if mid_channels is None:
             mid_channels = in_channels
-
-        def _gn_groups(channels):
-            groups = min(32, channels)
-            while channels % groups != 0:
-                groups -= 1
-            return groups
 
         layers = []
         cur_channels = in_channels
@@ -48,12 +49,6 @@ class UNetLikeSegHead(nn.Module):
         super().__init__()
         if mid_channels is None:
             mid_channels = in_channels
-
-        def _gn_groups(channels):
-            groups = min(32, channels)
-            while channels % groups != 0:
-                groups -= 1
-            return groups
 
         blocks = []
         cur_channels = in_channels
@@ -170,17 +165,17 @@ class DetectionHead(nn.Module):
         # Initial projection
         self.input_conv = nn.Sequential(
             nn.Conv2d(fpn_out_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
+            nn.GroupNorm(_gn_groups(mid_channels), mid_channels),
             nn.ReLU(),
         )
         
         # Feature refinement with residual connection
         self.refine_conv = nn.Sequential(
             nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
+            nn.GroupNorm(_gn_groups(mid_channels), mid_channels),
             nn.ReLU(),
             nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
+            nn.GroupNorm(_gn_groups(mid_channels), mid_channels),
         )
         
         # Lightweight channel attention (SE-like, but simpler)
@@ -280,27 +275,28 @@ class CenterNetDetectionHead(nn.Module):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(fpn_out_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
+            nn.GroupNorm(_gn_groups(mid_channels), mid_channels),
             nn.ReLU(inplace=True),
         )
         self.heatmap_head = nn.Sequential(
             nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
+            nn.GroupNorm(_gn_groups(mid_channels), mid_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(mid_channels, 1, kernel_size=1)
         )
         self.size_head = nn.Sequential(
             nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
+            nn.GroupNorm(_gn_groups(mid_channels), mid_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(mid_channels, 2, kernel_size=1),
         )
         self.offset_head = nn.Sequential(
             nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
+            nn.GroupNorm(_gn_groups(mid_channels), mid_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(mid_channels, 2, kernel_size=1),
         )
+        nn.init.constant_(self.heatmap_head[-1].bias, -2.19)
 
     def forward(self, fpn_features):
         x = self.stem(fpn_features)
@@ -393,8 +389,8 @@ def build_task_head(task_config, fpn_out_channels, encoder_channels, model_confi
         use_deep_supervision = head_cfg.get('use_deep_supervision', False)
         
         if use_deep_supervision:
-            num_aux = head_cfg.get('num_aux_outputs', 3)
-            upsampling = head_cfg.get('upsampling', 4)
+            num_aux = int(head_cfg.get('num_aux_outputs', 3))
+            upsampling = int(head_cfg.get('upsampling', 4))
             head = DeepSupervisionSegHead(
                 fpn_out_channels=fpn_out_channels,
                 num_classes=num_classes,
@@ -404,29 +400,32 @@ def build_task_head(task_config, fpn_out_channels, encoder_channels, model_confi
         else:
             seg_type = head_cfg.get('type', 'standard')
             if seg_type == 'unet_like':
+                mid_channels = head_cfg.get('mid_channels')
                 head = UNetLikeSegHead(
                     in_channels=fpn_out_channels,
                     num_classes=num_classes,
-                    upsampling=head_cfg.get('upsampling', 4),
-                    mid_channels=head_cfg.get('mid_channels'),
-                    num_blocks=head_cfg.get('num_blocks', 2)
+                    upsampling=int(head_cfg.get('upsampling', 4)),
+                    mid_channels=int(mid_channels) if mid_channels is not None else None,
+                    num_blocks=int(head_cfg.get('num_blocks', 2))
                 )
             else:
+                mid_channels = head_cfg.get('mid_channels')
                 head = SegmentationHead(
                     in_channels=fpn_out_channels,
                     num_classes=num_classes,
-                    upsampling=head_cfg.get('upsampling', 4),
-                    mid_channels=head_cfg.get('mid_channels'),
-                    num_layers=head_cfg.get('num_layers', 2)
+                    upsampling=int(head_cfg.get('upsampling', 4)),
+                    mid_channels=int(mid_channels) if mid_channels is not None else None,
+                    num_layers=int(head_cfg.get('num_layers', 2))
                 )
     
     elif task_name == 'classification':
         head_cfg = heads_cfg.get('classification', {})
+        mlp_hidden_dim = head_cfg.get('mlp_hidden_dim')
         head = ClassificationHead(
             encoder_channels=encoder_channels,
             num_classes=num_classes,
-            dropout=head_cfg.get('dropout', 0.2),
-            mlp_hidden_dim=head_cfg.get('mlp_hidden_dim'),
+            dropout=float(head_cfg.get('dropout', 0.2)),
+            mlp_hidden_dim=int(mlp_hidden_dim) if mlp_hidden_dim is not None else None,
             in_channels=fpn_out_channels if use_fpn_for_cls else None
         )
     
@@ -436,25 +435,26 @@ def build_task_head(task_config, fpn_out_channels, encoder_channels, model_confi
         if det_type == 'centernet':
             head = CenterNetDetectionHead(
                 fpn_out_channels=fpn_out_channels,
-                mid_channels=head_cfg.get('mid_channels', 128)
+                mid_channels=int(head_cfg.get('mid_channels', 128))
             )
         else:
             head = DetectionHead(
                 fpn_out_channels=fpn_out_channels,
                 num_classes=num_classes,
-                mid_channels=head_cfg.get('mid_channels', 128),
-                num_anchors=head_cfg.get('num_anchors', 1)
+                mid_channels=int(head_cfg.get('mid_channels', 128)),
+                num_anchors=int(head_cfg.get('num_anchors', 1))
             )
     
     elif task_name == 'Regression':
         # num_classes is actually num_points for regression tasks
         num_points = num_classes
         head_cfg = heads_cfg.get('regression', {})
+        hidden_dims = head_cfg.get('hidden_dims')
         head = RegressionHead(
             encoder_channels=encoder_channels,
             num_points=num_points,
-            hidden_dims=head_cfg.get('hidden_dims'),
-            dropout=head_cfg.get('dropout', 0.1),
+            hidden_dims=[int(d) for d in hidden_dims] if hidden_dims is not None else None,
+            dropout=float(head_cfg.get('dropout', 0.1)),
             use_tanh=head_cfg.get('use_tanh', True),
             in_channels=fpn_out_channels if use_fpn_for_reg else None
         )

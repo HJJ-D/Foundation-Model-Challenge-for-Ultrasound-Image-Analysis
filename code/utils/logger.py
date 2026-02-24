@@ -5,6 +5,7 @@ Saves metrics in CSV and JSON formats for easy analysis and plotting.
 
 import json
 import csv
+import yaml
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
@@ -47,6 +48,7 @@ class TrainingLogger:
         self.train_loss_csv = self.experiment_dir / 'train_losses.csv'
         self.val_metrics_csv = self.experiment_dir / 'val_metrics.csv'
         self.summary_csv = self.experiment_dir / 'training_summary.csv'
+        self.moe_stats_csv = self.experiment_dir / 'moe_stats.csv'
         
         # JSON file
         self.history_json = self.experiment_dir / 'training_history.json'
@@ -57,7 +59,7 @@ class TrainingLogger:
         print(f"Timestamp: {self.timestamp}")
         print(f"{'='*80}\n")
     
-    def log_epoch(self, epoch, train_losses, val_results_df, learning_rate, epoch_time=None, adaptive_weights=None):
+    def log_epoch(self, epoch, train_losses, val_results_df, learning_rate, epoch_time=None, adaptive_weights=None, moe_stats=None):
         """
         Log metrics for one epoch.
         
@@ -81,6 +83,8 @@ class TrainingLogger:
         # Add adaptive weights if provided
         if adaptive_weights is not None:
             epoch_data['adaptive_weights'] = adaptive_weights
+        if moe_stats is not None:
+            epoch_data['moe_stats'] = moe_stats
         
         # Process training losses
         for task_id, losses in train_losses.items():
@@ -118,6 +122,7 @@ class TrainingLogger:
         self._save_val_metrics_csv()
         # Also save a human-readable validation summary (per-epoch)
         self._save_summary_csv()
+        self._save_moe_stats_csv()
     
     def _save_json(self):
         """Save complete history as JSON."""
@@ -244,6 +249,50 @@ class TrainingLogger:
         
         df = pd.DataFrame(rows)
         df.to_csv(self.summary_csv, index=False, encoding='utf-8')
+
+    def _save_moe_stats_csv(self):
+        """Save MoE importance/load stats per task and per task group."""
+        if not self.history['epochs']:
+            return
+
+        max_experts = 0
+        for epoch_data in self.history['epochs']:
+            moe_stats = epoch_data.get('moe_stats', {})
+            for scope_key in ('by_task_id', 'by_task_name'):
+                for entry in moe_stats.get(scope_key, {}).values():
+                    importance = entry.get('importance', [])
+                    if len(importance) > max_experts:
+                        max_experts = len(importance)
+
+        if max_experts == 0:
+            return
+
+        rows = []
+        for epoch_data in self.history['epochs']:
+            epoch = epoch_data['epoch']
+            timestamp = epoch_data['timestamp']
+            moe_stats = epoch_data.get('moe_stats', {})
+            for scope_key, scope_name in (('by_task_id', 'task_id'), ('by_task_name', 'task_name')):
+                entries = moe_stats.get(scope_key, {})
+                for key, entry in entries.items():
+                    row = {
+                        'epoch': epoch,
+                        'timestamp': timestamp,
+                        'scope': scope_name,
+                        'id': key,
+                        'task_name': entry.get('task_name'),
+                        'aux_loss': entry.get('aux_loss')
+                    }
+                    importance = entry.get('importance', [])
+                    load = entry.get('load', [])
+                    for i in range(max_experts):
+                        row[f'importance_{i}'] = importance[i] if i < len(importance) else None
+                        row[f'load_{i}'] = load[i] if i < len(load) else None
+                    rows.append(row)
+
+        if rows:
+            df = pd.DataFrame(rows)
+            df.to_csv(self.moe_stats_csv, index=False, encoding='utf-8')
 
     def _save_best_model_summary_txt(self, best_model_eval_on_train=None):
         """Save a human-readable validation summary for the latest epoch.
@@ -377,9 +426,9 @@ class TrainingLogger:
     
     def save_config(self, config_dict):
         """Save training configuration."""
-        config_path = self.experiment_dir / 'config.json'
+        config_path = self.experiment_dir / 'config.yaml'
         with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(config_dict, f, indent=2, ensure_ascii=False)
+            yaml.dump(config_dict, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
     
     def save_final_summary(self, best_epoch, best_score):
         """Save final training summary."""
@@ -414,7 +463,8 @@ class TrainingLogger:
             f.write(f"  - train_losses.csv (training losses per epoch)\n")
             f.write(f"  - val_metrics.csv (validation metrics per task per epoch)\n")
             f.write(f"  - training_summary.csv (summary metrics per epoch)\n")
-            f.write(f"  - config.json (training configuration)\n")
+            f.write(f"  - moe_stats.csv (MoE importance/load per task)\n")
+            f.write(f"  - config.yaml (training configuration)\n")
         
         print(f"\n{'='*80}")
         print(f"Training logs saved to: {self.experiment_dir}")

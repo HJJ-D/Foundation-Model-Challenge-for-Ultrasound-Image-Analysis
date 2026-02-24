@@ -176,13 +176,13 @@ def build_dataloaders(config):
 def build_optimizer(model, config, loss_weighter=None):
     """Build optimizer with optional grouped learning rates and adaptive loss parameters."""
     use_grouped_lr = config.get('training.optimizer.use_grouped_lr', True)
-    lr = config.learning_rate
-    weight_decay = config.weight_decay
+    lr = float(config.learning_rate)
+    weight_decay = float(config.weight_decay)
     
     if use_grouped_lr:
         encoder_params, head_params = model.get_trainable_parameters()
-        encoder_lr_mult = config.get('training.optimizer.encoder_lr_multiplier', 0.1)
-        head_lr_mult = config.get('training.optimizer.head_lr_multiplier', 1.0)
+        encoder_lr_mult = float(config.get('training.optimizer.encoder_lr_multiplier', 0.1))
+        head_lr_mult = float(config.get('training.optimizer.head_lr_multiplier', 1.0))
         
         param_groups = [
             {'params': encoder_params, 'lr': lr * encoder_lr_mult},
@@ -195,7 +195,7 @@ def build_optimizer(model, config, loss_weighter=None):
     # Add adaptive loss parameters if using adaptive weighting
     from losses.loss_functions import AdaptiveLossWeighter
     if isinstance(loss_weighter, AdaptiveLossWeighter):
-        adaptive_lr = config.get('training.adaptive_loss.learning_rate', lr)
+        adaptive_lr = float(config.get('training.adaptive_loss.learning_rate', lr))
         param_groups.append({
             'params': loss_weighter.parameters(),
             'lr': adaptive_lr
@@ -209,7 +209,7 @@ def build_optimizer(model, config, loss_weighter=None):
     elif optimizer_type == 'Adam':
         optimizer = torch.optim.Adam(param_groups, lr=lr, weight_decay=weight_decay)
     elif optimizer_type == 'SGD':
-        momentum = config.get('training.optimizer.momentum', 0.9)
+        momentum = float(config.get('training.optimizer.momentum', 0.9))
         optimizer = torch.optim.SGD(param_groups, lr=lr, momentum=momentum, weight_decay=weight_decay)
     else:
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")
@@ -224,21 +224,21 @@ def build_scheduler(optimizer, config):
     scheduler_type = config.get('training.scheduler.type', 'CosineAnnealingLR')
     
     if scheduler_type == 'CosineAnnealingLR':
-        T_max = config.get('training.scheduler.T_max', config.num_epochs)
-        eta_min = config.get('training.scheduler.eta_min', 1e-6)
+        T_max = int(config.get('training.scheduler.T_max', config.num_epochs))
+        eta_min = float(config.get('training.scheduler.eta_min', 1e-6))
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=T_max, eta_min=eta_min
         )
     elif scheduler_type == 'ReduceLROnPlateau':
         mode = config.get('training.scheduler.mode', 'max')
-        factor = config.get('training.scheduler.factor', 0.5)
-        patience = config.get('training.scheduler.patience', 5)
+        factor = float(config.get('training.scheduler.factor', 0.5))
+        patience = int(config.get('training.scheduler.patience', 5))
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode=mode, factor=factor, patience=patience
         )
     elif scheduler_type == 'StepLR':
-        step_size = config.get('training.scheduler.step_size', 20)
-        gamma = config.get('training.scheduler.gamma', 0.1)
+        step_size = int(config.get('training.scheduler.step_size', 20))
+        gamma = float(config.get('training.scheduler.gamma', 0.1))
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=step_size, gamma=gamma
         )
@@ -258,10 +258,13 @@ def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, de
     model.train()
     epoch_losses = defaultdict(list)
     epoch_task_weights = defaultdict(list)  # Track adaptive weights
+    moe_task_stats = {}
+    moe_group_stats = {}
     
     task_id_to_name = {cfg['task_id']: cfg['task_name'] for cfg in config.get_task_configs()}
     use_deep_supervision = config.get('model.heads.segmentation.use_deep_supervision', False)
-    aux_loss_weights = config.get('model.heads.segmentation.aux_loss_weights', [0.5, 0.3, 0.2])
+    aux_loss_weights = [float(w) for w in config.get('model.heads.segmentation.aux_loss_weights', [0.5, 0.3, 0.2])]
+    moe_balance_weight = float(config.get('model.moe.balance_loss_weight', 0.0))
     
     # Check if using adaptive loss
     from losses.loss_functions import AdaptiveLossWeighter
@@ -270,14 +273,33 @@ def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, de
         loss_weights.train()  # Ensure it's in training mode
         
         # Warmup: freeze adaptive weights for first N epochs
-        warmup_epochs = config.get('training.adaptive_loss.warmup_epochs', 0)
+        warmup_epochs = int(config.get('training.adaptive_loss.warmup_epochs', 0))
         freeze_adaptive = current_epoch < warmup_epochs
         if freeze_adaptive and current_epoch == 0:
             print(f"  [Adaptive Loss Warmup] Freezing adaptive weights for first {warmup_epochs} epochs")
         elif not freeze_adaptive and current_epoch == warmup_epochs:
             print(f"  [Adaptive Loss Warmup] Unfreezing adaptive weights from epoch {current_epoch+1}")
     
-    print_freq = config.get('training.print_freq', 50)
+    print_freq = int(config.get('training.print_freq', 50))
+
+    def _update_moe_stats(stats_dict, key, task_name, importance, load, aux_val):
+        if key not in stats_dict:
+            stats_dict[key] = {
+                'task_name': task_name,
+                'importance_sum': importance.copy(),
+                'load_sum': load.copy(),
+                'count': 1,
+                'aux_sum': float(aux_val) if aux_val is not None else 0.0,
+                'aux_count': 1 if aux_val is not None else 0,
+            }
+            return
+        entry = stats_dict[key]
+        entry['importance_sum'] += importance
+        entry['load_sum'] += load
+        entry['count'] += 1
+        if aux_val is not None:
+            entry['aux_sum'] += float(aux_val)
+            entry['aux_count'] += 1
     
     for batch_idx, batch in enumerate(train_loader):
         images = batch['image'].to(device)
@@ -302,6 +324,20 @@ def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, de
         
         # Forward pass
         outputs = model(images, task_id=current_task_id)
+
+        # MoE stats aggregation (per task_id and task_name)
+        if hasattr(model, "get_moe_stats"):
+            moe_stats = model.get_moe_stats()
+            if moe_stats:
+                importance = torch.stack([s["importance"] for s in moe_stats]).mean(dim=0)
+                load = torch.stack([s["load"] for s in moe_stats]).mean(dim=0)
+                importance = importance.detach().cpu().numpy()
+                load = load.detach().cpu().numpy()
+                aux_val = None
+                if hasattr(model, "get_moe_aux_loss"):
+                    aux_val = float(model.get_moe_aux_loss().detach().cpu())
+                _update_moe_stats(moe_task_stats, current_task_id, task_name, importance, load, aux_val)
+                _update_moe_stats(moe_group_stats, task_name, task_name, importance, load, aux_val)
         
         # Compute loss
         if task_name == 'segmentation' and use_deep_supervision and isinstance(outputs, tuple):
@@ -343,8 +379,9 @@ def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, de
                     cy = (y1 + y2) * 0.5
                     gw = torch.clamp((cx * W).long(), 0, W - 1)
                     gh = torch.clamp((cy * H).long(), 0, H - 1)
-                    target_size[i, 0, gh, gw] = (x2 - x1)
-                    target_size[i, 1, gh, gw] = (y2 - y1)
+                    target_size[i, 0, gh, gw] = (x2 - x1) * W   # box_w in feature cells
+                    target_size[i, 1, gh, gw] = (y2 - y1) * H   # box_h in feature cells
+
                     target_offset[i, 0, gh, gw] = cx * W - gw.float()
                     target_offset[i, 1, gh, gw] = cy * H - gh.float()
                     target_mask[i, 0, gh, gw] = 1.0
@@ -393,14 +430,20 @@ def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, de
             # Use fixed weight
             task_weight = loss_weights.get(task_name, 1.0)
             total_loss = loss * task_weight
+
+        # Add MoE load-balancing loss (Switch-style)
+        if moe_balance_weight > 0 and hasattr(model, "get_moe_aux_loss"):
+            moe_aux_loss = model.get_moe_aux_loss()
+            total_loss = total_loss + moe_balance_weight * moe_aux_loss
         
         # Backward pass
         optimizer.zero_grad()
         total_loss.backward()
         
         # Gradient clipping
-        if config.get('training.gradient_clip', 0) > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.get('training.gradient_clip'))
+        gradient_clip = float(config.get('training.gradient_clip', 0))
+        if gradient_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
         
         # During warmup, don't update adaptive loss parameters
         if use_adaptive_loss and freeze_adaptive:
@@ -421,12 +464,53 @@ def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, de
                 print(f"  Batch [{batch_idx+1}/{len(train_loader)}] | Task: {current_task_id} | Loss: {avg_loss:.4f} | Weight: {avg_weight:.4f}")
             else:
                 print(f"  Batch [{batch_idx+1}/{len(train_loader)}] | Task: {current_task_id} | Loss: {avg_loss:.4f}")
+
+            # MoE stats (importance/load) summary
+            if hasattr(model, "get_moe_stats"):
+                moe_stats = model.get_moe_stats()
+                if moe_stats:
+                    importance = torch.stack([s["importance"] for s in moe_stats]).mean(dim=0)
+                    load = torch.stack([s["load"] for s in moe_stats]).mean(dim=0)
+                    importance = importance.detach().cpu().numpy()
+                    load = load.detach().cpu().numpy()
+                    imp_str = ", ".join([f"{v:.2f}" for v in importance])
+                    load_str = ", ".join([f"{v:.2f}" for v in load])
+                    moe_aux = model.get_moe_aux_loss() if hasattr(model, "get_moe_aux_loss") else None
+                    if moe_aux is not None:
+                        moe_aux_val = float(moe_aux.detach().cpu())
+                        print(f"    MoE avg importance: [{imp_str}] | avg load: [{load_str}] | aux: {moe_aux_val:.4f}")
+                    else:
+                        print(f"    MoE avg importance: [{imp_str}] | avg load: [{load_str}]")
     
     # Return both losses and weights
+    def _finalize_moe_stats(stats_dict):
+        output = {}
+        for key, entry in stats_dict.items():
+            count = entry['count']
+            if count == 0:
+                continue
+            importance_mean = (entry['importance_sum'] / count).tolist()
+            load_mean = (entry['load_sum'] / count).tolist()
+            out_entry = {
+                'task_name': entry['task_name'],
+                'importance': importance_mean,
+                'load': load_mean,
+            }
+            if entry['aux_count'] > 0:
+                out_entry['aux_loss'] = float(entry['aux_sum'] / entry['aux_count'])
+            output[key] = out_entry
+        return output
+
+    moe_stats_output = None
+    if moe_task_stats or moe_group_stats:
+        moe_stats_output = {
+            'by_task_id': _finalize_moe_stats(moe_task_stats),
+            'by_task_name': _finalize_moe_stats(moe_group_stats),
+        }
     if use_adaptive_loss:
-        return epoch_losses, epoch_task_weights
+        return epoch_losses, epoch_task_weights, moe_stats_output
     else:
-        return epoch_losses
+        return epoch_losses, moe_stats_output
 
 
 def main(config_path=None):
@@ -494,9 +578,9 @@ def main(config_path=None):
         # Handle return value (might include weights for adaptive loss)
         from losses.loss_functions import AdaptiveLossWeighter
         if isinstance(loss_weights, AdaptiveLossWeighter):
-            epoch_losses, epoch_task_weights = train_result
+            epoch_losses, epoch_task_weights, moe_stats = train_result
         else:
-            epoch_losses = train_result
+            epoch_losses, moe_stats = train_result
             epoch_task_weights = None
         
         epoch_train_time = time.time() - epoch_start_time
@@ -575,7 +659,8 @@ def main(config_path=None):
             val_results_df=val_results_df,
             learning_rate=current_lr,
             epoch_time=epoch_total_time,
-            adaptive_weights=adaptive_weights
+            adaptive_weights=adaptive_weights,
+            moe_stats=moe_stats,
         )
         
         # Save best model and best model summary

@@ -8,3 +8,8 @@ plot_training.py
 *.md
 quick_example.py
 dataset/
+baseline/
+code.zip
+detection_bbox_verification.png
+code/models/__pycache__/encoders.cpython-312.pyc.1604474761552
+.vscode/settings.json

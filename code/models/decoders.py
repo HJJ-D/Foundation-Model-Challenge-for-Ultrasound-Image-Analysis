@@ -21,9 +21,9 @@ def build_fpn_decoder(encoder, config, decoder_type='seg'):
     encoder_name = config.get('model.encoder.name')
     
     # Get FPN configuration
-    pyramid_channels = config.get('model.decoder.pyramid_channels', 256)
-    segmentation_channels = config.get('model.decoder.segmentation_channels', 128)
-    dropout = config.get('model.decoder.dropout', 0.2)
+    pyramid_channels = int(config.get('model.decoder.pyramid_channels', 256))
+    segmentation_channels = int(config.get('model.decoder.segmentation_channels', 128))
+    dropout = float(config.get('model.decoder.dropout', 0.2))
     merge_policy = config.get('model.decoder.merge_policy', 'cat')
     
     if getattr(encoder, "is_timm_encoder", False):

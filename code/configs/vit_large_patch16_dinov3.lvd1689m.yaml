@@ -2,9 +2,9 @@
 
 # Experiment settings
 experiment:
-  name: "DINOv3_spm_interaction"
+  name: "vit_large_patch16_dinov3.lvd1689m"
   seed: 42
-  output_dir: "outputs/DINOv3_spm_interaction"
+  output_dir: "outputs"
   save_checkpoints: false
   checkpoint_freq: 10  # Save every N epochs
 
@@ -12,12 +12,12 @@ experiment:
 data:
   root_path: "/proj/uppmax2025-2-369/Cgrain/ult/data/train"
   val_split: 0.2
-  batch_size: 64
+  batch_size: 32
   num_workers: 4
   pin_memory: true
   
   # Image settings
-  image_size: 224  # Must match encoder requirements
+  image_size: 256  # Must match encoder requirements
   
   # Augmentation settings
   augmentation:
@@ -28,8 +28,8 @@ data:
       vertical_flip: 0.0
     
     normalize:
-      mean: [0.330189, 0.330189, 0.330189]
-      std: [0.178211, 0.178211, 0.178211]
+      mean: [0.329834, 0.329834, 0.329834]
+      std: [0.178765, 0.178765, 0.178765]
 
 # Model architecture
 model:
@@ -52,11 +52,11 @@ model:
   encoder:
     name: "dinov3"  # swin_*, dinov3, or timm:<model_name>
     timm_name: "vit_large_patch16_dinov3.lvd1689m"  # replace with a valid timm DINOv3 model in your environment
-    out_indices: [5, 11, 17, 23]  # DINOv3 intermediate blocks used by adapter
+    out_indices: [2, 10, 16, 23]  # DINOv3 intermediate blocks used by adapter
     freeze_dino: true  # freeze DINO backbone only
     adapter_channels: 256  # backward-compatible fallback
     adapter:
-      type: "spm_interaction"  # "resize" (old path) or "spm_interaction" (CNN pyramid + deformable cross-attn)
+      type: "resize"  # "resize" (old path) or "spm_interaction" (CNN pyramid + deformable cross-attn)
       channels: 256
       spm_stem_channels: 64
       interaction_heads: 8
@@ -69,16 +69,16 @@ model:
   decoder:
     type: "fpn"  # Feature Pyramid Network
     pyramid_channels: 256
-    segmentation_channels: 256
-    dropout: 0.1
+    segmentation_channels: 128
+    dropout: 0.2
     merge_policy: "cat"
     
     # Use separate FPN for detection (avoid conflict with segmentation)
     separate_detection_fpn: true
     separate_classification_fpn: true
     separate_regression_fpn: true
-    use_fpn_for_classification: false
-    use_fpn_for_regression: false
+    use_fpn_for_classification: true
+    use_fpn_for_regression: true
   
   # FiLM (Feature-wise Linear Modulation) settings
   use_film: true 
@@ -98,7 +98,6 @@ model:
       use_deep_supervision: false
       num_aux_outputs: 3
       aux_loss_weights: [0.5, 0.3, 0.2]
-      upsampling: 4
     
     classification:
       mid_channels: 256
