@@ -163,7 +163,15 @@ class TimmEncoder(nn.Module):
     """Generic timm encoder wrapper compatible with FPN decoder."""
     is_timm_encoder = True
 
-    def __init__(self, model_name: str, pretrained: bool = True, img_size: int = 224, out_indices=None):
+    def __init__(
+        self, 
+        model_name: str, 
+        pretrained: bool = True, 
+        img_size: int = 224, 
+        out_indices=None,
+        adapter_channels: Optional[int] = None,
+        use_adapter: bool = True,
+    ):
         super().__init__()
         full_model_name = VIT_MODEL_MAPPING.get(model_name, model_name)
         if out_indices is not None and not isinstance(out_indices, tuple):
@@ -177,8 +185,21 @@ class TimmEncoder(nn.Module):
         )
         self._target_stages = 4
         self._raw_channels = list(self.model.feature_info.channels())
-        self._out_channels = self._normalize_channels(self._raw_channels)
+        self._normalized_channels = self._normalize_channels(self._raw_channels)
         self.output_stride = self._infer_output_stride()
+        
+        # For ViT models, use adapter to create true multi-scale features
+        self.use_adapter = use_adapter
+        if self.use_adapter and adapter_channels is not None:
+            self.adapter = FourScaleAdapter(
+                in_channels=self._normalized_channels,
+                out_channels=adapter_channels,
+                target_strides=(4, 8, 16, 32),
+            )
+            self._out_channels = list(self.adapter.out_channels)
+        else:
+            self.adapter = None
+            self._out_channels = self._normalized_channels
 
     def _infer_output_stride(self):
         if hasattr(self.model, "feature_info"):
@@ -256,8 +277,14 @@ class TimmEncoder(nn.Module):
             self._format_feature(feat, expected[idx] if idx < len(expected) else expected[-1])
             for idx, feat in enumerate(features)
         ]
-        features = self._normalize_features(features, x.shape[-2:])
-        return features
+        
+        if self.adapter is not None:
+            # Use adapter for better multi-scale features (important for ViT)
+            return self.adapter(features, x.shape[-2:])
+        else:
+            # Fallback: simple resize
+            features = self._normalize_features(features, x.shape[-2:])
+            return features
 
     @property
     def out_channels(self):
@@ -641,6 +668,7 @@ def build_encoder(config, task_ids=None):
     
     Args:
         config: Configuration object
+        task_ids: Optional list of task IDs for MoE
     
     Returns:
         encoder: PyTorch encoder module
@@ -661,6 +689,26 @@ def build_encoder(config, task_ids=None):
             task_ids=task_ids,
         )
         print(f"Loaded Swin Transformer: {encoder_name} (img_size={img_size})")
+    
+    elif encoder_name.startswith('vit_'):
+        # Use TimmEncoder for ViT models with adapter for multi-scale features
+        pretrained = (encoder_weights == 'imagenet' or encoder_weights is not None)
+        adapter_channels = config.get('model.encoder.adapter_channels', None)
+        if adapter_channels is not None:
+            adapter_channels = int(adapter_channels)
+        
+        encoder = TimmEncoder(
+            model_name=encoder_name,
+            pretrained=pretrained,
+            img_size=img_size,
+            out_indices=out_indices,
+            adapter_channels=adapter_channels,
+            use_adapter=True,
+        )
+        full_name = VIT_MODEL_MAPPING.get(encoder_name, encoder_name)
+        adapter_info = f" with adapter (channels={adapter_channels})" if adapter_channels else ""
+        print(f"Loaded ViT encoder: {encoder_name} -> {full_name} (img_size={img_size}){adapter_info}")
+    
     elif encoder_name.startswith('dinov3') or (encoder_name.startswith('timm:') and 'dinov3' in encoder_name):
         pretrained = (encoder_weights == 'imagenet' or encoder_weights is not None)
         timm_name = config.get('model.encoder.timm_name', encoder_name.replace('timm:', ''))
@@ -696,21 +744,30 @@ def build_encoder(config, task_ids=None):
             f"(img_size={img_size}, adapter_type={adapter_type}, "
             f"adapter_channels={adapter_channels}, freeze_dino={freeze_dino}{mapping_info})"
         )
+    
     else:
         timm_name = encoder_name
         use_timm = False
         if encoder_name.startswith('timm:'):
             timm_name = encoder_name.split(':', 1)[1]
             use_timm = True
+        
         if use_timm:
             pretrained = (encoder_weights == 'imagenet' or encoder_weights is not None)
+            adapter_channels = config.get('model.encoder.adapter_channels', None)
+            if adapter_channels is not None:
+                adapter_channels = int(adapter_channels)
+            
             encoder = TimmEncoder(
                 model_name=timm_name,
                 pretrained=pretrained,
                 img_size=img_size,
-                out_indices=out_indices
+                out_indices=out_indices,
+                adapter_channels=adapter_channels,
+                use_adapter=(adapter_channels is not None),
             )
-            print(f"Loaded timm encoder: {timm_name} (img_size={img_size})")
+            adapter_info = f" with adapter (channels={adapter_channels})" if adapter_channels else ""
+            print(f"Loaded timm encoder: {timm_name} (img_size={img_size}){adapter_info}")
         else:
             # Use standard segmentation_models_pytorch encoder, fallback to timm if not found
             try:
@@ -723,12 +780,19 @@ def build_encoder(config, task_ids=None):
                 print(f"Loaded encoder: {encoder_name}")
             except Exception:
                 pretrained = (encoder_weights == 'imagenet' or encoder_weights is not None)
+                adapter_channels = config.get('model.encoder.adapter_channels', None)
+                if adapter_channels is not None:
+                    adapter_channels = int(adapter_channels)
+                
                 encoder = TimmEncoder(
                     model_name=timm_name,
                     pretrained=pretrained,
                     img_size=img_size,
-                    out_indices=out_indices
+                    out_indices=out_indices,
+                    adapter_channels=adapter_channels,
+                    use_adapter=(adapter_channels is not None),
                 )
-                print(f"Loaded timm encoder: {timm_name} (img_size={img_size})")
+                adapter_info = f" with adapter (channels={adapter_channels})" if adapter_channels else ""
+                print(f"Loaded timm encoder: {timm_name} (img_size={img_size}){adapter_info}")
     
     return encoder

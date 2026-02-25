@@ -354,6 +354,80 @@ class RegressionHead(nn.Module):
         return x
 
 
+# ====================================================================
+# --- Baseline (Simple) Head Implementations ---
+# ====================================================================
+
+class BaselineSmpClassificationHead(nn.Module):
+    """Baseline wrapper for SMP Classification Head (simpler version)."""
+    
+    def __init__(self, in_channels, num_classes, dropout=0.2):
+        super().__init__()
+        self.head = smp.base.ClassificationHead(
+            in_channels=in_channels,
+            classes=num_classes,
+            pooling="avg",
+            dropout=dropout,
+            activation=None,
+        )
+        
+    def forward(self, features):
+        """Use the last feature map from encoder."""
+        if isinstance(features, (list, tuple)):
+            x = features[-1]
+        else:
+            x = features
+        return self.head(x)
+
+
+class BaselineRegressionHead(nn.Module):
+    """Baseline regression head (simpler version with single linear layer)."""
+    
+    def __init__(self, in_channels, num_points):
+        super().__init__()
+        self.pooling = nn.AdaptiveAvgPool2d(1)
+        self.flatten = nn.Flatten()
+        # Output dimension is num_points * 2 (x, y)
+        self.linear = nn.Linear(in_channels, num_points * 2)
+
+    def forward(self, features):
+        """Use the last feature map from encoder."""
+        if isinstance(features, (list, tuple)):
+            x = features[-1]
+        else:
+            x = features
+        x = self.pooling(x)
+        x = self.flatten(x)
+        return self.linear(x)
+
+
+class BaselineFPNGridDetectionHead(nn.Module):
+    """Baseline detection head designed for FPN outputs (simpler version)."""
+    
+    def __init__(self, fpn_out_channels, num_classes=1, num_anchors=1, mid_channels=128):
+        super().__init__()
+        num_outputs = num_anchors * (4 + num_classes)
+        
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(fpn_out_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(),
+            nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(),
+            nn.Conv2d(mid_channels, num_outputs, kernel_size=1)
+        )
+
+    def forward(self, fpn_features):
+        """Input fpn_features is already a single fused tensor from FPN Decoder."""
+        predictions_map = self.conv_block(fpn_features)
+        
+        # Apply sigmoid to bbox coordinates (first 4 channels)
+        predictions_map[:, :4] = torch.sigmoid(predictions_map[:, :4])
+        
+        return predictions_map
+
+
 def _get_heads_config(model_config):
     if not isinstance(model_config, dict):
         return {}
@@ -383,6 +457,9 @@ def build_task_head(task_config, fpn_out_channels, encoder_channels, model_confi
         decoder_cfg = model_config.get('decoder', {}) or {}
     use_fpn_for_cls = decoder_cfg.get('use_fpn_for_classification', True)
     use_fpn_for_reg = decoder_cfg.get('use_fpn_for_regression', True)
+    
+    # Check if baseline mode is enabled
+    use_baseline = heads_cfg.get('use_baseline', False)
     
     if task_name == 'segmentation':
         head_cfg = heads_cfg.get('segmentation', {})
@@ -420,19 +497,37 @@ def build_task_head(task_config, fpn_out_channels, encoder_channels, model_confi
     
     elif task_name == 'classification':
         head_cfg = heads_cfg.get('classification', {})
-        mlp_hidden_dim = head_cfg.get('mlp_hidden_dim')
-        head = ClassificationHead(
-            encoder_channels=encoder_channels,
-            num_classes=num_classes,
-            dropout=float(head_cfg.get('dropout', 0.2)),
-            mlp_hidden_dim=int(mlp_hidden_dim) if mlp_hidden_dim is not None else None,
-            in_channels=fpn_out_channels if use_fpn_for_cls else None
-        )
+        if use_baseline or head_cfg.get('type') == 'baseline':
+            # Use baseline simple classification head
+            in_ch = encoder_channels[-1]
+            head = BaselineSmpClassificationHead(
+                in_channels=in_ch,
+                num_classes=num_classes,
+                dropout=float(head_cfg.get('dropout', 0.2))
+            )
+        else:
+            # Use advanced classification head with optional MLP
+            mlp_hidden_dim = head_cfg.get('mlp_hidden_dim')
+            head = ClassificationHead(
+                encoder_channels=encoder_channels,
+                num_classes=num_classes,
+                dropout=float(head_cfg.get('dropout', 0.2)),
+                mlp_hidden_dim=int(mlp_hidden_dim) if mlp_hidden_dim is not None else None,
+                in_channels=fpn_out_channels if use_fpn_for_cls else None
+            )
     
     elif task_name == 'detection':
         head_cfg = heads_cfg.get('detection', {})
         det_type = head_cfg.get('type', 'centernet')
-        if det_type == 'centernet':
+        if use_baseline or det_type == 'baseline':
+            # Use baseline simple detection head
+            head = BaselineFPNGridDetectionHead(
+                fpn_out_channels=fpn_out_channels,
+                num_classes=num_classes,
+                mid_channels=int(head_cfg.get('mid_channels', 128)),
+                num_anchors=int(head_cfg.get('num_anchors', 1))
+            )
+        elif det_type == 'centernet':
             head = CenterNetDetectionHead(
                 fpn_out_channels=fpn_out_channels,
                 mid_channels=int(head_cfg.get('mid_channels', 128))
@@ -449,15 +544,24 @@ def build_task_head(task_config, fpn_out_channels, encoder_channels, model_confi
         # num_classes is actually num_points for regression tasks
         num_points = num_classes
         head_cfg = heads_cfg.get('regression', {})
-        hidden_dims = head_cfg.get('hidden_dims')
-        head = RegressionHead(
-            encoder_channels=encoder_channels,
-            num_points=num_points,
-            hidden_dims=[int(d) for d in hidden_dims] if hidden_dims is not None else None,
-            dropout=float(head_cfg.get('dropout', 0.1)),
-            use_tanh=head_cfg.get('use_tanh', True),
-            in_channels=fpn_out_channels if use_fpn_for_reg else None
-        )
+        if use_baseline or head_cfg.get('type') == 'baseline':
+            # Use baseline simple regression head
+            in_ch = encoder_channels[-1]
+            head = BaselineRegressionHead(
+                in_channels=in_ch,
+                num_points=num_points
+            )
+        else:
+            # Use advanced regression head with MLP and tanh
+            hidden_dims = head_cfg.get('hidden_dims')
+            head = RegressionHead(
+                encoder_channels=encoder_channels,
+                num_points=num_points,
+                hidden_dims=[int(d) for d in hidden_dims] if hidden_dims is not None else None,
+                dropout=float(head_cfg.get('dropout', 0.1)),
+                use_tanh=head_cfg.get('use_tanh', True),
+                in_channels=fpn_out_channels if use_fpn_for_reg else None
+            )
     
     else:
         raise ValueError(f"Unknown task type: {task_name}")

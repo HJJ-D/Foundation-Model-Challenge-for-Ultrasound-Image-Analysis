@@ -26,27 +26,27 @@ def build_fpn_decoder(encoder, config, decoder_type='seg'):
     dropout = float(config.get('model.decoder.dropout', 0.2))
     merge_policy = config.get('model.decoder.merge_policy', 'cat')
     
-    if getattr(encoder, "is_timm_encoder", False):
-        # For timm-based encoders, use custom FPN decoder
-        encoder_channels = encoder.out_channels
-        decoder = FPNDecoder(
-            encoder_channels=encoder_channels,
-            encoder_depth=5,  # 5 = input + 4 stages
-            pyramid_channels=pyramid_channels,
-            segmentation_channels=segmentation_channels,
-            dropout=dropout,
-            merge_policy=merge_policy
-        )
+    # Get encoder output channels in FPN format: [input_channels, stage1, stage2, ...]
+    # Custom wrapper encoders (Swin/ViT/DINOv3) already include input channel in out_channels
+    # SMP encoders (ResNet/EfficientNet) don't include it, need to prepend [3]
+    if hasattr(encoder, 'is_timm_encoder') and encoder.is_timm_encoder:
+        encoder_channels = encoder.out_channels  # Already [3, c1, c2, c3, c4]
     else:
-        # For standard encoders, use smp FPN
-        encoder_weights = config.get('model.encoder.pretrained')
-        temp_model = smp.FPN(
-            encoder_name=encoder_name,
-            encoder_weights=encoder_weights,
-            in_channels=3,
-            classes=1
-        )
-        decoder = temp_model.decoder
+        # SMP encoders: [c1, c2, c3, c4, c5] -> [3, c1, c2, c3, c4, c5]
+        encoder_channels = [3] + list(encoder.out_channels)
+    
+    # encoder_depth is the number of feature stages (excluding input)
+    encoder_depth = len(encoder_channels) - 1
+    
+    # Create FPN decoder with encoder channel information
+    decoder = FPNDecoder(
+        encoder_channels=encoder_channels,
+        encoder_depth=encoder_depth,
+        pyramid_channels=pyramid_channels,
+        segmentation_channels=segmentation_channels,
+        dropout=dropout,
+        merge_policy=merge_policy
+    )
     
     suffix_map = {
         'seg': 'segmentation',

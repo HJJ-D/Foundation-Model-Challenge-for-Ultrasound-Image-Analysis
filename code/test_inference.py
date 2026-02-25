@@ -189,8 +189,7 @@ class InferenceModel:
         # Create and load model using Config
         print(f"\nLoading model...")
         config = Config()  # 直接使用 config.yaml
-        # 动态设置 task_configs
-        config.config['tasks'] = self.task_configs
+        config.set_task_configs_from_dataset(self.task_configs)
         
         self.model = MultiTaskModel(config).to(self.device)
         

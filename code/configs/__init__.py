@@ -86,6 +86,16 @@ class Config:
     def get_task_configs(self) -> List[Dict]:
         """Get all task configurations."""
         return self.config['tasks']
+
+    def set_task_configs_from_dataset(self, task_configs: List[Dict]):
+        """Set task configurations from loaded dataset and mark runtime source."""
+        self.config['tasks'] = task_configs
+        runtime_cfg = self.config.setdefault('runtime', {})
+        runtime_cfg['tasks_from_dataset'] = True
+
+    def tasks_from_dataset(self) -> bool:
+        """Whether current task configurations were populated from dataset metadata."""
+        return bool(self.get('runtime.tasks_from_dataset', False))
     
     def get_loss_config(self, task_name: str) -> Dict:
         """Get loss configuration for specific task."""

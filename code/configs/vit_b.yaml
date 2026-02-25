@@ -1,0 +1,128 @@
+# ViT-B Configuration with FourScaleAdapter for Multi-Scale Features
+# This config demonstrates how to properly use ViT encoder with FPN decoder
+
+experiment:
+  name: vit_b_baseline_with_adapter
+  seed: 42
+  output_dir: outputs
+  save_checkpoints: true
+  checkpoint_freq: 10
+
+data:
+  root_path: "dataset/"
+  val_split: 0.2
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+  image_size: 224  # Must match ViT patch size requirements
+  
+  augmentation:
+    train:
+      random_brightness_contrast: 0.2
+      gauss_noise: 0.1
+      horizontal_flip: 0.0
+      vertical_flip: 0.0
+    normalize:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+
+model:
+  # MoE settings (optional)
+  moe:
+    enabled: false
+    num_experts: 8
+    top_k: 1
+    stage_indices: [2, 3]
+    expert_hidden: 256
+    router_hidden: 256
+    balance_loss_weight: 0.05
+    use_task_embedding: true
+    task_embedding_dim: 64
+    use_residual: true
+    dropout: 0.0
+
+  # Encoder settings
+  encoder:
+    name: vit_b  # Will be mapped to 'vit_base_patch16_224'
+    pretrained: imagenet
+    freeze_encoder: false
+    
+    # IMPORTANT: adapter_channels enables FourScaleAdapter for ViT
+    # This creates proper multi-scale features (stride 4/8/16/32) from ViT output
+    # Without this, ViT features will all have the same resolution (14x14)
+    adapter_channels: 256  # Set to match decoder pyramid_channels
+    
+    # Optional: out_indices to control which ViT layers to extract
+    # Default uses evenly spaced layers across the 12 transformer blocks
+    # out_indices: [2, 5, 8, 11]  # Early, mid-early, mid-late, late layers
+
+  # Decoder settings
+  decoder:
+    type: fpn  # Feature Pyramid Network
+    pyramid_channels: 256  # Should match adapter_channels
+    segmentation_channels: 128
+    dropout: 0.2
+    merge_policy: cat  # 'cat' or 'add'
+    
+    # Separate decoders for each task type
+    separate_detection_fpn: true
+    separate_classification_fpn: true
+    separate_regression_fpn: true
+    
+    # Whether to use FPN features for classification/regression
+    use_fpn_for_classification: false
+    use_fpn_for_regression: false
+
+  # FiLM modulation (optional)
+  use_film: false
+  film:
+    use_task_embedding: false
+    embedding_dim: 64
+    use_affine: true
+
+  # Task prompt (optional, MTUS-Net inspired)
+  task_prompt:
+    enabled: false
+    channels: 1
+    prompt_size: 32
+    inject_mode: add  # 'add' or 'concat'
+    init_scale: 0.1
+    use_tanh: true
+
+# Loss settings
+losses:
+  adaptive_loss:
+    enabled: true
+    init_weights:
+      segmentation: 1.0
+      classification: 1.0
+      detection: 1.0
+      regression: 1.0
+    min_weight: 0.1
+    max_weight: 10.0
+    update_freq: 100
+
+  moe_balance_loss_weight: 0.05
+
+# Training settings
+training:
+  epochs: 100
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  optimizer: adamw
+  scheduler: cosine
+  warmup_epochs: 5
+  gradient_clip: 1.0
+  
+  # Mixed precision training
+  use_amp: true
+  
+  # Evaluation
+  eval_freq: 1
+  patience: 15
+
+# Logging
+logging:
+  log_freq: 50
+  tensorboard: true
+  wandb: false

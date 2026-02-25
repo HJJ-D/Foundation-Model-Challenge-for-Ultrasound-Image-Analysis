@@ -104,8 +104,8 @@ def build_dataloaders(config):
             ].reset_index(drop=True)
             print(f"Single-task mode enabled by task_name: {single_task_name}")
 
-    # Update config with dynamic task_configs
-    config.config['tasks'] = task_configs
+    config.set_task_configs_from_dataset(task_configs)
+    print("Using dataset-derived task configurations for model/task-prompt (config tasks are overwritten at runtime).")
 
     print(f"Detected {len(task_configs)} tasks:")
     for cfg in sorted(task_configs, key=lambda x: x['task_id']):

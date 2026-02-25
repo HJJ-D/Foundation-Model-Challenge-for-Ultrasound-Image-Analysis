@@ -7,6 +7,7 @@ from .decoders import build_decoders
 from .heads import build_all_heads
 from .moe import MoEConvBlock
 from .film_layer import TaskFiLMGenerator, TaskEmbeddingFiLMGenerator, FiLMLayer
+from .task_prompt import TaskPrompt2D
 
 
 class MultiTaskModel(nn.Module):
@@ -31,12 +32,9 @@ class MultiTaskModel(nn.Module):
         task_ids = [cfg['task_id'] for cfg in self.task_configs]
         self.encoder = build_encoder(config, task_ids=task_ids)
         
-        # Get encoder output channels
-        if hasattr(self.encoder, 'out_channels'):
-            encoder_channels = self.encoder.out_channels
-        else:
-            # For standard smp encoders
-            encoder_channels = [3] + list(self.encoder.out_channels)
+        # Normalize encoder channel metadata to [in, c1, c2, ...]
+        raw_channels = list(self.encoder.out_channels)
+        encoder_channels = raw_channels if (raw_channels and raw_channels[0] == 3) else [3] + raw_channels
         
         # Build decoders
         decoders = build_decoders(self.encoder, config)
@@ -78,6 +76,29 @@ class MultiTaskModel(nn.Module):
             self.film_layer = FiLMLayer(
                 num_features=self.fpn_out_channels,
                 use_affine=use_affine
+            )
+
+        # Build TaskPrompt modulation (optional, input-level)
+        task_prompt_cfg = config.get('model.task_prompt', {}) or {}
+        self.use_task_prompt = bool(task_prompt_cfg.get('enabled', False))
+        if self.use_task_prompt:
+            if hasattr(config, 'tasks_from_dataset') and not config.tasks_from_dataset():
+                raise ValueError(
+                    "TaskPrompt2D requires dataset-derived task configs. "
+                    "Load dataset metadata and override config tasks before building the model."
+                )
+            self.task_prompt = TaskPrompt2D(
+                task_configs=self.task_configs,
+                out_channels=int(task_prompt_cfg.get('channels', 1)),
+                prompt_size=int(task_prompt_cfg.get('prompt_size', 32)),
+                inject_mode=str(task_prompt_cfg.get('inject_mode', 'add')).lower(),
+                init_scale=float(task_prompt_cfg.get('init_scale', 0.1)),
+                use_tanh=bool(task_prompt_cfg.get('use_tanh', True)),
+            )
+            print(
+                "Using TaskPrompt2D "
+                f"(dim={self.task_prompt.prompt_dim}, prompt_size={self.task_prompt.prompt_size}, "
+                f"mode={self.task_prompt.inject_mode})"
             )
 
         # Build MoE blocks (optional)
@@ -159,6 +180,10 @@ class MultiTaskModel(nn.Module):
         
         # Get task name
         task_name = self.task_id_to_name[task_id]
+
+        # Optional task-conditioned input prompt (MTUS-Net-inspired)
+        if self.use_task_prompt:
+            x = self.task_prompt.apply(x, task_id)
         
         # Encode features
         if getattr(self.encoder, "supports_task_id", False):
@@ -264,6 +289,8 @@ class MultiTaskModel(nn.Module):
         ):
             head_params += list(self.fpn_decoder_reg.parameters())
         head_params += list(self.heads.parameters())
+        if self.use_task_prompt:
+            head_params += list(self.task_prompt.parameters())
         
         return encoder_params, head_params
 

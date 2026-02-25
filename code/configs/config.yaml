@@ -87,6 +87,25 @@ model:
     use_task_embedding: false  # false: use shared gamma/beta per task; true: use task embeddings
     embedding_dim: 64  # Task embedding dimension (only used if use_task_embedding=true)
     use_affine: true  # true: use both gamma and beta; false: use gamma only
+
+  # TaskPrompt (MTUS-Net-style idea: task metadata -> 2D prompt map -> input modulation)
+  # Reference implementation for experimentation/learning; disabled by default.
+  task_prompt:
+    enabled: false
+    channels: 1      # 1 works via broadcasting to RGB input
+    prompt_size: 32  # projected low-res prompt, then upsampled to image size
+    inject_mode: "add"  # "add" or "mul"
+    init_scale: 0.1
+    use_tanh: true
+    # Prefer explicit task metadata (under each task item: `metadata:`). If a task has no metadata,
+    # it can still fall back to task_id token parsing (legacy behavior).
+    include_task_name_one_hot: true
+    use_task_id_tokens_fallback: true
+    # If unset, all discovered metadata keys are used. Set explicitly for stable experiments.
+    metadata_fields: ["subject", "anatomy", "target_type", "disease", "view_or_plane", "output_form", "region_id", "spatial_group"]
+    # Optional learnable residual embedding per task_id (complements one-hot/multi-hot metadata)
+    use_task_embedding_residual: false
+    task_embedding_dim: 16
   
   # Task heads
   heads:

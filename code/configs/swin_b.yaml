@@ -1,43 +1,33 @@
-# Multi-Task Ultrasound Image Analysis - Configuration File
-
-# Experiment settings
 experiment:
-  name: "swin-b_new_dataloader"
+  name: swin_b_baseline+prompt
   seed: 42
-  output_dir: "outputs"
+  output_dir: outputs
   save_checkpoints: false
-  checkpoint_freq: 10  # Save every N epochs
+  checkpoint_freq: 10
 
-# Data settings
 data:
-  root_path: "/proj/uppmax2025-2-369/Cgrain/ult/data/train"
+  root_path: "/proj/berzbiomedicalimagingkth/users/x_hujun/Foundation-Model-Challenge-for-Ultrasound-Image-Analysis/dataset/"
   val_split: 0.2
   batch_size: 64
   num_workers: 4
   pin_memory: true
-  
-  # Image settings
-  image_size: 256  # Must match encoder requirements
-  
-  # Augmentation settings
+  image_size: 224
   augmentation:
     train:
       random_brightness_contrast: 0.2
       gauss_noise: 0.1
-      horizontal_flip: 0.0  # Disabled for medical images
+      horizontal_flip: 0.0
       vertical_flip: 0.0
-    
     normalize:
-      mean: [0.329834, 0.329834, 0.329834]
-      std: [0.178765, 0.178765, 0.178765]
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
 
-# Model architecture
 model:
   moe:
     enabled: false
-    num_experts: 16
-    top_k: 2
-    stage_indices: [2, 3]
+    num_experts: 8
+    top_k: 1
+    stage_indices: [3, 4]
     expert_hidden: 256
     router_hidden: 256
     balance_loss_weight: 0.05
@@ -45,256 +35,232 @@ model:
     task_embedding_dim: 64
     use_residual: true
     dropout: 0.0
-    # optional: only apply to specific encoder feature indices
-    # stage_indices: [1, 2, 3]
 
-  # Encoder settings
   encoder:
-    name: "swin_b"  # swin_*, dinov3, or timm:<model_name>
-    timm_name: "swin_b"  # replace with a valid timm DINOv3 model in your environment
-    # out_indices: [6, 12, 18, 23]  # DINOv3 intermediate blocks used by adapter
-    freeze_dino: true  # freeze DINO backbone only
-    adapter_channels: 256  # backward-compatible fallback
-    adapter:
-      type: "resize"  # "resize" (old path) or "spm_interaction" (CNN pyramid + deformable cross-attn)
-      channels: 256
-      spm_stem_channels: 64
-      interaction_heads: 8
-      interaction_points: 4
-      interaction_offset_range: 0.25
-    pretrained: "imagenet"
-    freeze_encoder: false  # true will freeze the whole encoder (including SPM/interaction)
-  
-  # Decoder settings
+    name: swin_b
+    pretrained: imagenet
+    freeze_encoder: false
+
   decoder:
-    type: "fpn"  # Feature Pyramid Network
+    type: fpn
     pyramid_channels: 256
     segmentation_channels: 128
     dropout: 0.2
-    merge_policy: "cat"
-    
-    # Use separate FPN for detection (avoid conflict with segmentation)
+    merge_policy: cat
     separate_detection_fpn: true
     separate_classification_fpn: true
     separate_regression_fpn: true
-    use_fpn_for_classification: true
-    use_fpn_for_regression: true
-  
-  # FiLM (Feature-wise Linear Modulation) settings
-  use_film: true 
+    use_fpn_for_classification: false
+    use_fpn_for_regression: false
+
+  use_film: false
   film:
-    # whether to use task embeddings to generate FiLM parameters
-    use_task_embedding: false  # false: use shared gamma/beta per task; true: use task embeddings
-    embedding_dim: 64  # Task embedding dimension (only used if use_task_embedding=true)
-    use_affine: true  # true: use both gamma and beta; false: use gamma only
-  
-  # Task heads
+    use_task_embedding: false
+    embedding_dim: 64
+    use_affine: true
+
   heads:
     segmentation:
-      type: "default"
+      type: baseline
       upsampling: 4
       mid_channels: 128
       num_blocks: 2
       use_deep_supervision: false
       num_aux_outputs: 3
       aux_loss_weights: [0.5, 0.3, 0.2]
-    
+
     classification:
+      type: baseline
       mid_channels: 256
-      # mlp_hidden_dim: 512
       dropout: 0.3
-    
+
     detection:
+      type: baseline
       mid_channels: 128
-      type: "centernet"
       num_anchors: 1
-    
+
     regression:
+      type: baseline
       hidden_dims: [256, 128]
       use_tanh: true
       mid_channels: 256
       dropout: 0.3
 
-# Training settings
 training:
   num_epochs: 50
 
-  # Single-task training (optional)
   single_task:
     enabled: false
     task_id: ""
-    task_name: "Detection"
-  
-  # Optimizer
+    task_name: Detection
+
   optimizer:
-    type: "AdamW"
-    learning_rate: 1.0e-4
-    weight_decay: 1.0e-4
-    
-    # Grouped learning rates
+    type: AdamW
+    learning_rate: 0.0001
+    weight_decay: 0.0001
     use_grouped_lr: true
-    encoder_lr_multiplier: 0.1  # encoder_lr = lr * 0.1
-    head_lr_multiplier: 1.0     # head_lr = lr * 1.0
-  
-  # Learning rate scheduler
+    encoder_lr_multiplier: 0.1
+    head_lr_multiplier: 1.0
+
   scheduler:
-    type: "CosineAnnealingLR"  # CosineAnnealingLR, ReduceLROnPlateau, StepLR
-    T_max: 50  # For CosineAnnealingLR
-    eta_min: 1.0e-6
-    
-    # For ReduceLROnPlateau
-    # mode: "max"
-    # factor: 0.5
-    # patience: 5
-    
-    # For StepLR
-    # step_size: 20
-    # gamma: 0.1
-  
-  # Loss weights per task type
+    type: CosineAnnealingLR
+    T_max: 50
+    eta_min: 1e-6
+
   loss_weights:
     segmentation: 1.0
     classification: 1.0
-    detection: 2.0
+    detection: 1.0
     regression: 1.0
-  
-  # Adaptive loss weighting (uncertainty-based)
+
   adaptive_loss:
-    enabled: false  # Set to true to enable adaptive loss weighting
+    enabled: false
     init_log_vars: -1.0
-    learning_rate: 1.0e-4
-    warmup_epochs: 15
-  
-  # Task-specific loss settings
+    learning_rate: 0.0001
+    warmup_epochs: 3
+
   loss_configs:
     segmentation:
-      type: "DiceLoss"
-      mode: "multiclass"
-    
+      type: DiceLoss
+      mode: multiclass
+
     classification:
-      type: "CrossEntropyLoss"
-    
+      type: CrossEntropyLoss
+
     detection:
-      type: "CenterNet"
+      type: CenterNet
       heatmap_alpha: 2.0
       heatmap_gamma: 4.0
       size_weight: 1.0
       offset_weight: 1.0
       classification_weight: 2.0
       box_regression_weight: 1.0
-    
+
     regression:
-      type: "MSELoss"
-  
-  # Gradient settings
+      type: MSELoss
+
   gradient_clip: 1.0
   accumulation_steps: 1
-  
-  # Logging
-  print_freq: 50  # Print every N batches
+  print_freq: 50
   log_metrics: true
 
-# Validation settings
 validation:
   enabled: true
-  freq: 1  # Validate every N epochs
+  freq: 1
   save_best_model: true
-  metric_for_best: "mean_score"  # Which metric to use for model selection
+  metric_for_best: mean_score
 
-# Device settings
 device:
   use_cuda: true
   multi_gpu: false
   device_ids: [0]
-  mixed_precision: false  # AMP training
+  mixed_precision: false
 
-# Task configurations (from dataset)
 tasks:
-  # Segmentation tasks (12 total)
-  - task_id: "T2A_fetal_abdomen"
-    task_name: "segmentation"
+  - task_id: T2A_fetal_abdomen
+    task_name: segmentation
     num_classes: 2
-  - task_id: "T2A_fetal_brain"
-    task_name: "segmentation"
+
+  - task_id: T2A_fetal_brain
+    task_name: segmentation
     num_classes: 2
-  - task_id: "T2A_fetal_femur"
-    task_name: "segmentation"
+
+  - task_id: T2A_fetal_femur
+    task_name: segmentation
     num_classes: 2
-  - task_id: "T2A_fetal_thorax"
-    task_name: "segmentation"
+
+  - task_id: T2A_fetal_thorax
+    task_name: segmentation
     num_classes: 2
-  - task_id: "T2B_adult_liver_segment_2"
-    task_name: "segmentation"
+
+  - task_id: T2B_adult_liver_segment_2
+    task_name: segmentation
     num_classes: 2
-  - task_id: "T2B_adult_liver_segment_3"
-    task_name: "segmentation"
+
+  - task_id: T2B_adult_liver_segment_3
+    task_name: segmentation
     num_classes: 2
-  - task_id: "T2B_adult_liver_segment_4a"
-    task_name: "segmentation"
+
+  - task_id: T2B_adult_liver_segment_4a
+    task_name: segmentation
     num_classes: 2
-  - task_id: "T2B_adult_liver_segment_5"
-    task_name: "segmentation"
+
+  - task_id: T2B_adult_liver_segment_5
+    task_name: segmentation
     num_classes: 2
-  - task_id: "T2B_adult_liver_segment_6"
-    task_name: "segmentation"
+
+  - task_id: T2B_adult_liver_segment_6
+    task_name: segmentation
     num_classes: 2
-  - task_id: "T2B_adult_liver_segment_7"
-    task_name: "segmentation"
+
+  - task_id: T2B_adult_liver_segment_7
+    task_name: segmentation
     num_classes: 2
-  - task_id: "T2B_adult_liver_segment_8"
-    task_name: "segmentation"
+
+  - task_id: T2B_adult_liver_segment_8
+    task_name: segmentation
     num_classes: 2
-  - task_id: "T2C_fetal_head"
-    task_name: "segmentation"
+
+  - task_id: T2C_fetal_head
+    task_name: segmentation
     num_classes: 2
-  
-  # Classification tasks (9 total)
-  - task_id: "T1_fetal_planes"
-    task_name: "classification"
+
+  - task_id: T1_fetal_planes
+    task_name: classification
     num_classes: 6
-  - task_id: "T3A_breast_lymph_nodes"
-    task_name: "classification"
+
+  - task_id: T3A_breast_lymph_nodes
+    task_name: classification
     num_classes: 2
-  - task_id: "T3A_breast_tumor"
-    task_name: "classification"
+
+  - task_id: T3A_breast_tumor
+    task_name: classification
     num_classes: 2
-  - task_id: "T3B_liver_injury"
-    task_name: "classification"
+
+  - task_id: T3B_liver_injury
+    task_name: classification
     num_classes: 2
-  - task_id: "T3B_liver_steatosis"
-    task_name: "classification"
+
+  - task_id: T3B_liver_steatosis
+    task_name: classification
     num_classes: 2
-  - task_id: "T3C_thyroid_nodule"
-    task_name: "classification"
+
+  - task_id: T3C_thyroid_nodule
+    task_name: classification
     num_classes: 2
-  - task_id: "T3D_liver_cirrhosis"
-    task_name: "classification"
+
+  - task_id: T3D_liver_cirrhosis
+    task_name: classification
     num_classes: 2
-  - task_id: "T3D_liver_fibrosis"
-    task_name: "classification"
+
+  - task_id: T3D_liver_fibrosis
+    task_name: classification
     num_classes: 2
-  - task_id: "T3E_thyroid_cancer"
-    task_name: "classification"
+
+  - task_id: T3E_thyroid_cancer
+    task_name: classification
     num_classes: 2
-  
-  # Detection tasks (3 total)
-  - task_id: "T4A_fetal_abdomen"
-    task_name: "detection"
+
+  - task_id: T4A_fetal_abdomen
+    task_name: detection
     num_classes: 1
-  - task_id: "T4A_fetal_brain"
-    task_name: "detection"
+
+  - task_id: T4A_fetal_brain
+    task_name: detection
     num_classes: 1
-  - task_id: "T4A_fetal_femur"
-    task_name: "detection"
+
+  - task_id: T4A_fetal_femur
+    task_name: detection
     num_classes: 1
-  
-  # Regression tasks (3 total)
-  - task_id: "T5_fetal_abdomen"
-    task_name: "Regression"
+
+  - task_id: T5_fetal_abdomen
+    task_name: Regression
     num_classes: 4
-  - task_id: "T5_fetal_brain"
-    task_name: "Regression"
+
+  - task_id: T5_fetal_brain
+    task_name: Regression
     num_classes: 4
-  - task_id: "T5_fetal_femur"
-    task_name: "Regression"
+
+  - task_id: T5_fetal_femur
+    task_name: Regression
     num_classes: 4
