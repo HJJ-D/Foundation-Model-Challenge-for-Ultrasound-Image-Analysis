@@ -38,7 +38,7 @@ code/
 │   └── config.yaml              # Main configuration file
 ├── data/
 │   ├── dataset.py               # MultiTaskDataset & sampler
-│   └── new_dataloader.py
+│   └── new_dataloader.py        # 
 ├── models/
 │   ├── encoders.py              # Swin / ViT / ResNet / DINOv3 encoders
 │   ├── decoders.py              # FPN decoders
@@ -66,7 +66,7 @@ dataset/                         # Dataset directory
 ## Environment Setup
 
 ```bash
-conda create -n ultrasound python=3.8
+conda create -n ultrasound python=3.10
 conda activate ultrasound
 
 pip install torch torchvision
@@ -372,45 +372,6 @@ training:
     task_id: "T2A_fetal_abdomen"
     task_name: segmentation
 ```
-
----
-
-## Inference & Docker
-
-### Docker Deployment
-
-```bash
-# Build
-docker build -t my-submission:latest docker/
-
-# Test locally
-docker run --gpus all --rm \
-  -v /path/to/data:/input/:ro \
-  -v /path/to/output:/output \
-  my-submission:latest
-
-# Debug inside container
-docker run --gpus all --rm \
-  -v /path/to/data:/input/:ro \
-  -v /path/to/output:/output \
-  -it my-submission:latest /bin/bash
-```
-
-### Output Format
-
-- **Segmentation**: mask images saved to `{output_dir}/` matching CSV `mask_path`
-- **Classification / Detection / Regression**: JSON files
-
----
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| CUDA OOM | Reduce `data.batch_size`, or enable `device.mixed_precision: true` |
-| Loss not decreasing | Check learning rate; try `encoder_lr_multiplier: 0.01`; adjust `loss_weights` |
-| Poor segmentation | Enable deep supervision; switch to `unet_like` head; increase `mid_channels` |
-| ViT training slow | Freeze encoder first (`freeze_encoder: true`), finetune later |
 
 ---
 
