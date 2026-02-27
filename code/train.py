@@ -604,13 +604,38 @@ def main(config_path=None):
         print(f"\nRunning validation...")
         val_results_df = evaluate(model, val_loader, config.device, config.get_task_configs())
         
-        # Calculate average validation score (higher is better)
-        # Exclude MAE columns as lower is better for MAE
-        score_cols = [col for col in val_results_df.columns 
-                     if 'MAE' not in col and isinstance(val_results_df[col].iloc[0] if len(val_results_df) > 0 else 0, (int, float, np.number))]
-        avg_val_score = 0
-        if not val_results_df.empty and score_cols:
-            avg_val_score = val_results_df[score_cols].mean().mean()
+        # Calculate average validation score (higher is better).
+        # Per-task scoring:
+        #   classification : (Accuracy + F1-Score) / 2  (avoids double-counting)
+        #   segmentation   : Dice
+        #   detection      : IoU
+        #   Regression     : (upper_bound - MAE) / (upper_bound - lower_bound), clipped to [0, 1]
+        MAE_UPPER_BOUND = 100.0  # pixels — adjust if typical MAE range differs
+        MAE_LOWER_BOUND = 0.0
+        task_scores = []
+        if not val_results_df.empty:
+            for _, row in val_results_df.iterrows():
+                task_name = row['Task Name']
+                if task_name == 'classification':
+                    acc = row.get('Accuracy', np.nan)
+                    f1  = row.get('F1-Score', np.nan)
+                    vals = [v for v in [acc, f1] if pd.notna(v)]
+                    if vals:
+                        task_scores.append(float(np.mean(vals)))
+                elif task_name == 'segmentation':
+                    dice = row.get('Dice', np.nan)
+                    if pd.notna(dice):
+                        task_scores.append(float(dice))
+                elif task_name == 'detection':
+                    iou = row.get('IoU', np.nan)
+                    if pd.notna(iou):
+                        task_scores.append(float(iou))
+                elif task_name == 'Regression':
+                    mae = row.get('MAE (pixels)', np.nan)
+                    if pd.notna(mae):
+                        normalized = (MAE_UPPER_BOUND - mae) / (MAE_UPPER_BOUND - MAE_LOWER_BOUND)
+                        task_scores.append(float(np.clip(normalized, 0.0, 1.0)))
+        avg_val_score = float(np.mean(task_scores)) if task_scores else 0.0
         
         print(f"\n--- Epoch {epoch+1} Validation Report ---")
         if not val_results_df.empty:
