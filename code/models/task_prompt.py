@@ -9,8 +9,8 @@ import torch.nn.functional as F
 
 
 _TASK_PREFIX_RE = re.compile(r"^t\d+[a-z]?$", re.IGNORECASE)
-_LOW_INFO_TOKEN_RE = re.compile(r"^\d+cls$", re.IGNORECASE)
-_LOW_INFO_TOKENS = {"det", "multi", "cls"}
+# _LOW_INFO_TOKEN_RE = re.compile(r"^\d+cls$", re.IGNORECASE)
+#_LOW_INFO_TOKENS = {"det", "multi", "cls"}
 
 
 def _tokenize_task_id(task_id: str) -> List[str]:
@@ -19,8 +19,8 @@ def _tokenize_task_id(task_id: str) -> List[str]:
         p
         for p in parts
         if not _TASK_PREFIX_RE.match(p)
-        and not _LOW_INFO_TOKEN_RE.match(p)
-        and p not in _LOW_INFO_TOKENS
+        # and not _LOW_INFO_TOKEN_RE.match(p)
+        # and p not in _LOW_INFO_TOKENS
     ]
 
 
@@ -35,8 +35,10 @@ def build_task_prompt_metadata(task_configs: Sequence[Dict]) -> Tuple[torch.Tens
     """
     task_ids = [str(cfg["task_id"]) for cfg in task_configs]
     task_names = [str(cfg.get("task_name", "unknown")).lower() for cfg in task_configs]
+    num_classes_tags = [f"num_classes_{int(cfg.get('num_classes', -1))}" for cfg in task_configs]
 
     type_vocab = sorted(set(task_names))
+    class_vocab = sorted(set(num_classes_tags))
 
     token_sets = []
     token_vocab = set()
@@ -50,15 +52,22 @@ def build_task_prompt_metadata(task_configs: Sequence[Dict]) -> Tuple[torch.Tens
     token_to_idx = {tok: i for i, tok in enumerate(token_vocab)}
     task_id_to_idx = {task_id: i for i, task_id in enumerate(task_ids)}
 
-    prompt_dim = len(type_vocab) + len(token_vocab)
+    prompt_dim = len(type_vocab) + len(class_vocab) + len(token_vocab)
     metadata = torch.zeros(len(task_ids), prompt_dim, dtype=torch.float32)
 
-    for row, (task_name, tokens) in enumerate(zip(task_names, token_sets)):
-        metadata[row, type_to_idx[task_name]] = 1.0
-        for tok in tokens:
-            metadata[row, len(type_vocab) + token_to_idx[tok]] = 1.0
+    class_to_idx = {name: i for i, name in enumerate(class_vocab)}
 
-    vocab_info = {"task_types": type_vocab, "task_tokens": token_vocab}
+    for row, (task_name, class_tag, tokens) in enumerate(zip(task_names, num_classes_tags, token_sets)):
+        metadata[row, type_to_idx[task_name]] = 1.0
+        metadata[row, len(type_vocab) + class_to_idx[class_tag]] = 1.0
+        for tok in tokens:
+            metadata[row, len(type_vocab) + len(class_vocab) + token_to_idx[tok]] = 1.0
+
+    vocab_info = {
+        "task_types": type_vocab,
+        "num_classes_tags": class_vocab,
+        "task_tokens": token_vocab,
+    }
     return metadata, task_id_to_idx, vocab_info
 
 

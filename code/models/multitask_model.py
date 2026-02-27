@@ -81,6 +81,11 @@ class MultiTaskModel(nn.Module):
         # Build TaskPrompt modulation (optional, input-level)
         task_prompt_cfg = config.get('model.task_prompt', {}) or {}
         self.use_task_prompt = bool(task_prompt_cfg.get('enabled', False))
+        apply_task_names = task_prompt_cfg.get('apply_to_task_names', None)
+        if apply_task_names is None:
+            self.task_prompt_apply_task_names = None
+        else:
+            self.task_prompt_apply_task_names = {str(name).lower() for name in apply_task_names}
         if self.use_task_prompt:
             if hasattr(config, 'tasks_from_dataset') and not config.tasks_from_dataset():
                 raise ValueError(
@@ -100,6 +105,10 @@ class MultiTaskModel(nn.Module):
                 f"(dim={self.task_prompt.prompt_dim}, prompt_size={self.task_prompt.prompt_size}, "
                 f"mode={self.task_prompt.inject_mode})"
             )
+            if self.task_prompt_apply_task_names is None:
+                print("TaskPrompt2D apply scope: all task types")
+            else:
+                print(f"TaskPrompt2D apply scope: {sorted(self.task_prompt_apply_task_names)}")
 
         # Build MoE blocks (optional)
         moe_cfg = config.get('model.moe', {}) or {}
@@ -182,7 +191,11 @@ class MultiTaskModel(nn.Module):
         task_name = self.task_id_to_name[task_id]
 
         # Optional task-conditioned input prompt (MTUS-Net-inspired)
-        if self.use_task_prompt:
+        use_task_prompt_for_current = self.use_task_prompt
+        if use_task_prompt_for_current and self.task_prompt_apply_task_names is not None:
+            use_task_prompt_for_current = task_name.lower() in self.task_prompt_apply_task_names
+
+        if use_task_prompt_for_current:
             x = self.task_prompt.apply(x, task_id)
         
         # Encode features

@@ -146,7 +146,11 @@ def evaluate(model, val_loader, device, task_configs):
                             y2 = cy + box_h * 0.5
                             final_boxes[i] = torch.stack([x1, y1, x2, y2]).clamp(0.0, 1.0)
 
-                        task_metrics[task_id]['IoU'].append(calculate_iou(task_labels, final_boxes))
+                        valid_mask = (task_labels >= 0).all(dim=1)
+                        if valid_mask.any():
+                            task_metrics[task_id]['IoU'].append(
+                                calculate_iou(task_labels[valid_mask], final_boxes[valid_mask])
+                            )
                     else:
                         # Logic to extract best bounding box from grid prediction
                         batch_size, _, h, w = outputs.shape
@@ -159,8 +163,12 @@ def evaluate(model, val_loader, device, task_configs):
                         final_boxes = torch.zeros((batch_size, 4), device=device)
                         for i in range(batch_size):
                             final_boxes[i] = outputs[i, :4, best_h[i], best_w[i]]
-                        
-                        task_metrics[task_id]['IoU'].append(calculate_iou(task_labels, final_boxes))
+
+                        valid_mask = (task_labels >= 0).all(dim=1)
+                        if valid_mask.any():
+                            task_metrics[task_id]['IoU'].append(
+                                calculate_iou(task_labels[valid_mask], final_boxes[valid_mask])
+                            )
 
     # Build results dataframe
     results = []
