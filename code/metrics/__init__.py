@@ -118,7 +118,10 @@ def evaluate(model, val_loader, device, task_configs):
                     task_metrics[task_id]['Dice'].append(calculate_dice_coefficient(task_labels.to(device), outputs))
                 
                 elif task_name == 'Regression':
-                    task_metrics[task_id]['MAE (pixels)'].append(calculate_mae(task_labels, outputs))
+                    image_size = (task_images.shape[-2], task_images.shape[-1])
+                    task_metrics[task_id]['MAE (pixels)'].append(
+                        calculate_mae(task_labels, outputs, image_size=image_size)
+                    )
                 
                 elif task_name == 'detection':
                     if isinstance(outputs, dict) and 'heatmap' in outputs:

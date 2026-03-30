@@ -256,6 +256,8 @@ def build_scheduler(optimizer, config):
 def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, device, config, current_epoch=0):
     """Train for one epoch."""
     model.train()
+    if hasattr(model, 'set_current_epoch'):
+        model.set_current_epoch(current_epoch)
     epoch_losses = defaultdict(list)
     epoch_task_weights = defaultdict(list)  # Track adaptive weights
     moe_task_stats = {}
@@ -542,6 +544,10 @@ def main(config_path=None):
     
     # Build model (using the task_configs from dataset)
     model = build_model(config).to(config.device)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.set_model_stats(total_params=total_params, trainable_params=trainable_params)
+    print(f"Model Parameters: total={total_params:,}, trainable={trainable_params:,}")
     
     # Build losses
     loss_functions, loss_weights = build_all_losses(config)
@@ -570,6 +576,7 @@ def main(config_path=None):
         print("-" * 80)
         
         # Train
+        train_start_time = time.time()
         train_result = train_epoch(
             model, train_loader, loss_functions, loss_weights,
             optimizer, config.device, config, current_epoch=epoch
@@ -583,7 +590,7 @@ def main(config_path=None):
             epoch_losses, moe_stats = train_result
             epoch_task_weights = None
         
-        epoch_train_time = time.time() - epoch_start_time
+        epoch_train_time = time.time() - train_start_time
         
         # Print epoch summary
         print(f"\nEpoch {epoch+1} Train Loss Summary:")
@@ -602,7 +609,9 @@ def main(config_path=None):
         
         # Validation
         print(f"\nRunning validation...")
+        inference_start_time = time.time()
         val_results_df = evaluate(model, val_loader, config.device, config.get_task_configs())
+        epoch_inference_time = time.time() - inference_start_time
         
         # Calculate average validation score (higher is better).
         # Per-task scoring:
@@ -684,6 +693,8 @@ def main(config_path=None):
             val_results_df=val_results_df,
             learning_rate=current_lr,
             epoch_time=epoch_total_time,
+            train_time=epoch_train_time,
+            inference_time=epoch_inference_time,
             adaptive_weights=adaptive_weights,
             moe_stats=moe_stats,
         )
@@ -705,6 +716,8 @@ def main(config_path=None):
             
             print(f"  Learning Rate: {current_lr:.2e}")
         
+        print(f"  Train Time: {epoch_train_time:.2f}s")
+        print(f"  Inference Time: {epoch_inference_time:.2f}s")
         print(f"  Epoch Time: {epoch_total_time:.2f}s")
         
         # Save checkpoint
@@ -769,7 +782,7 @@ def main(config_path=None):
                best_model_eval_on_train[group_name] = next((v for v in group_means.values() if v is not None), None)
 
     # Save best model summary at the end of training
-    logger._save_best_model_summary_txt(best_model_eval_on_train)
+    logger._save_best_model_summary_txt(best_model_eval_on_train, best_epoch=best_epoch)
     
     print(f"\n{'='*80}")
     print("Training Complete!")

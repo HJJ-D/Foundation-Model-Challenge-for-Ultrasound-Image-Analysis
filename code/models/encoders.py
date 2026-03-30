@@ -1,13 +1,128 @@
 """Encoder implementations."""
 
 import math
-from typing import Optional, List, Sequence
+from typing import Optional, List, Sequence, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
 import segmentation_models_pytorch as smp
 from .moe import MoEConvBlock
+
+
+# ---------------------------------------------------------------------------
+# LoRA (Low-Rank Adaptation) — manual implementation, no external library
+# ---------------------------------------------------------------------------
+
+class LoRALinear(nn.Module):
+    """Drop-in replacement for nn.Linear with a parallel low-rank branch.
+
+    Forward:  y = W x  +  scaling * B(A(x))
+    Only A and B are trainable; the original weight W stays frozen.
+    B is zero-initialised so the module is an identity at step 0.
+    """
+
+    def __init__(
+        self,
+        linear: nn.Linear,
+        r: int = 16,
+        alpha: float = 32.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if r <= 0:
+            raise ValueError(f"LoRA rank r must be > 0, got {r}")
+
+        in_features = linear.in_features
+        out_features = linear.out_features
+
+        # Freeze original weights
+        self.weight = linear.weight
+        self.weight.requires_grad = False
+        self.bias = linear.bias
+        if self.bias is not None:
+            self.bias.requires_grad = False
+
+        # Low-rank branch: A projects down to r, B projects back up
+        self.lora_A = nn.Linear(in_features, r, bias=False)
+        self.lora_B = nn.Linear(r, out_features, bias=False)
+        self.scaling = alpha / r
+        self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+        # Initialisation: A ~ kaiming, B = 0  →  initial delta = 0
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = F.linear(x, self.weight, self.bias)
+        delta = self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
+        return base + delta
+
+    def merge_weights(self) -> nn.Linear:
+        """Return a plain nn.Linear with LoRA baked into the weight (for export)."""
+        merged_weight = self.weight.data + (
+            self.lora_B.weight @ self.lora_A.weight
+        ) * self.scaling
+        new_linear = nn.Linear(
+            self.lora_A.in_features,
+            self.lora_B.out_features,
+            bias=self.bias is not None,
+        )
+        new_linear.weight.data.copy_(merged_weight)
+        if self.bias is not None:
+            new_linear.bias.data.copy_(self.bias.data)
+        return new_linear
+
+    def extra_repr(self) -> str:
+        in_f = self.lora_A.in_features
+        out_f = self.lora_B.out_features
+        r = self.lora_A.out_features
+        return f"in={in_f}, out={out_f}, r={r}, scaling={self.scaling:.3f}"
+
+
+def inject_lora(
+    model: nn.Module,
+    target_modules: Sequence[str],
+    r: int = 16,
+    alpha: float = 32.0,
+    dropout: float = 0.0,
+) -> int:
+    """Replace all nn.Linear layers whose *leaf name* is in target_modules with LoRALinear.
+
+    Args:
+        model:          The model to modify in-place.
+        target_modules: Leaf attribute names to replace, e.g. ["qkv", "proj"].
+        r:              LoRA rank.
+        alpha:          LoRA scaling factor (scaling = alpha / r).
+        dropout:        Dropout applied to the input of the low-rank branch.
+
+    Returns:
+        Number of layers replaced.
+    """
+    target_set = set(target_modules)
+    replaced = 0
+
+    # Collect (parent, leaf_name, module) before iterating to avoid mutation issues
+    replacements = []
+    for full_name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        leaf_name = full_name.split(".")[-1]
+        if leaf_name not in target_set:
+            continue
+        # Navigate to the parent module
+        parts = full_name.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        replacements.append((parent, parts[-1], module))
+
+    for parent, attr, linear in replacements:
+        lora_layer = LoRALinear(linear, r=r, alpha=alpha, dropout=dropout)
+        setattr(parent, attr, lora_layer)
+        replaced += 1
+
+    return replaced
 
 
 # Swin Transformer model name mapping
@@ -45,8 +160,10 @@ class SwinTransformerEncoder(nn.Module):
         img_size: int = 224,
         moe_config: Optional[dict] = None,
         task_ids: Optional[List[str]] = None,
+        input_channels: int = 3,
     ):
         super().__init__()
+        self.input_channels = int(input_channels)
         # Map simplified name to full timm model name
         full_model_name = SWIN_MODEL_MAPPING.get(model_name, model_name)
         
@@ -55,7 +172,8 @@ class SwinTransformerEncoder(nn.Module):
             pretrained=pretrained,
             features_only=True,
             out_indices=(0, 1, 2, 3),  # Swin has 4 stages
-            img_size=img_size  # Specify input image size
+            img_size=img_size,  # Specify input image size
+            in_chans=self.input_channels,
         )
         self._out_channels = self.model.feature_info.channels()
         self.output_stride = 32
@@ -156,7 +274,7 @@ class SwinTransformerEncoder(nn.Module):
     def out_channels(self):
         """Return encoder output channels for FPN decoder."""
         # FPN expects encoder_channels in format: [input_channels, stage0, stage1, stage2, stage3]
-        return [3] + list(self._out_channels)
+        return [self.input_channels] + list(self._out_channels)
 
 
 class TimmEncoder(nn.Module):
@@ -171,8 +289,10 @@ class TimmEncoder(nn.Module):
         out_indices=None,
         adapter_channels: Optional[int] = None,
         use_adapter: bool = True,
+        input_channels: int = 3,
     ):
         super().__init__()
+        self.input_channels = int(input_channels)
         full_model_name = VIT_MODEL_MAPPING.get(model_name, model_name)
         if out_indices is not None and not isinstance(out_indices, tuple):
             out_indices = tuple(out_indices)
@@ -181,7 +301,8 @@ class TimmEncoder(nn.Module):
             pretrained=pretrained,
             features_only=True,
             out_indices=out_indices,
-            img_size=img_size
+            img_size=img_size,
+            in_chans=self.input_channels,
         )
         self._target_stages = 4
         self._raw_channels = list(self.model.feature_info.channels())
@@ -289,7 +410,7 @@ class TimmEncoder(nn.Module):
     @property
     def out_channels(self):
         """Return encoder output channels for FPN decoder."""
-        return [3] + list(self._out_channels)
+        return [self.input_channels] + list(self._out_channels)
 
 
 class FourScaleAdapter(nn.Module):
@@ -503,8 +624,11 @@ class Dinov3Encoder(nn.Module):
         interaction_offset_range: float = 0.25,
         freeze_dino: bool = True,
         vit_layer_mapping: Optional[Sequence[int]] = None,
+        input_channels: int = 3,
+        lora_config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
+        self.input_channels = int(input_channels)
         self._target_stages = 4
         if out_indices is None:
             out_indices = (2, 5, 8, 11)
@@ -531,12 +655,37 @@ class Dinov3Encoder(nn.Module):
             features_only=True,
             out_indices=self.out_indices,
             img_size=img_size,
+            in_chans=self.input_channels,
         )
         self.freeze_dino = freeze_dino
         if self.freeze_dino:
             for param in self.model.parameters():
                 param.requires_grad = False
             self.model.eval()
+
+        # LoRA: inject low-rank trainable branches into frozen DINOv3 layers
+        self.use_lora = False
+        if lora_config and lora_config.get("enabled", False):
+            lora_r = int(lora_config.get("r", 16))
+            lora_alpha = float(lora_config.get("alpha", 32.0))
+            lora_dropout = float(lora_config.get("dropout", 0.0))
+            lora_targets = lora_config.get("target_modules", ["qkv", "proj"])
+            n_replaced = inject_lora(
+                self.model,
+                target_modules=lora_targets,
+                r=lora_r,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+            )
+            self.use_lora = True
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in self.model.parameters())
+            print(
+                f"✓ LoRA injected into DINOv3: {n_replaced} layers replaced "
+                f"(targets={lora_targets}, r={lora_r}, alpha={lora_alpha}) | "
+                f"trainable params: {trainable:,} / {total:,} "
+                f"({100 * trainable / max(total, 1):.2f}%)"
+            )
 
         if not hasattr(self.model, "feature_info"):
             raise ValueError(f"DINOv3 features_only model has no feature_info: {model_name}")
@@ -659,16 +808,17 @@ class Dinov3Encoder(nn.Module):
 
     @property
     def out_channels(self):
-        return [3] + list(self._out_channels)
+        return [self.input_channels] + list(self._out_channels)
 
 
-def build_encoder(config, task_ids=None):
+def build_encoder(config, task_ids=None, input_channels: int = 3):
     """
     Build encoder from configuration.
     
     Args:
         config: Configuration object
         task_ids: Optional list of task IDs for MoE
+        input_channels: Number of input channels for encoder stem
     
     Returns:
         encoder: PyTorch encoder module
@@ -687,6 +837,7 @@ def build_encoder(config, task_ids=None):
             img_size=img_size,
             moe_config=config.get('model.moe', {}),
             task_ids=task_ids,
+            input_channels=input_channels,
         )
         print(f"Loaded Swin Transformer: {encoder_name} (img_size={img_size})")
     
@@ -704,6 +855,7 @@ def build_encoder(config, task_ids=None):
             out_indices=out_indices,
             adapter_channels=adapter_channels,
             use_adapter=True,
+            input_channels=input_channels,
         )
         full_name = VIT_MODEL_MAPPING.get(encoder_name, encoder_name)
         adapter_info = f" with adapter (channels={adapter_channels})" if adapter_channels else ""
@@ -724,6 +876,7 @@ def build_encoder(config, task_ids=None):
         interaction_offset_range = float(adapter_cfg.get('interaction_offset_range', 0.25))
         vit_layer_mapping = adapter_cfg.get('vit_layer_mapping', None)
         freeze_dino = config.get('model.encoder.freeze_dino', True)
+        lora_config = config.get('model.encoder.lora', None)
         encoder = Dinov3Encoder(
             model_name=timm_name,
             pretrained=pretrained,
@@ -737,6 +890,8 @@ def build_encoder(config, task_ids=None):
             interaction_offset_range=interaction_offset_range,
             freeze_dino=freeze_dino,
             vit_layer_mapping=vit_layer_mapping,
+            input_channels=input_channels,
+            lora_config=lora_config,
         )
         mapping_info = f", vit_layer_mapping={vit_layer_mapping}" if vit_layer_mapping else ""
         print(
@@ -765,6 +920,7 @@ def build_encoder(config, task_ids=None):
                 out_indices=out_indices,
                 adapter_channels=adapter_channels,
                 use_adapter=(adapter_channels is not None),
+                input_channels=input_channels,
             )
             adapter_info = f" with adapter (channels={adapter_channels})" if adapter_channels else ""
             print(f"Loaded timm encoder: {timm_name} (img_size={img_size}){adapter_info}")
@@ -773,7 +929,7 @@ def build_encoder(config, task_ids=None):
             try:
                 encoder = smp.encoders.get_encoder(
                     name=encoder_name,
-                    in_channels=3,
+                    in_channels=input_channels,
                     depth=5,
                     weights=encoder_weights
                 )
@@ -791,8 +947,11 @@ def build_encoder(config, task_ids=None):
                     out_indices=out_indices,
                     adapter_channels=adapter_channels,
                     use_adapter=(adapter_channels is not None),
+                    input_channels=input_channels,
                 )
                 adapter_info = f" with adapter (channels={adapter_channels})" if adapter_channels else ""
                 print(f"Loaded timm encoder: {timm_name} (img_size={img_size}){adapter_info}")
     
+    # Keep a unified attribute for downstream modules (e.g., decoder channel metadata).
+    encoder.input_channels = int(input_channels)
     return encoder

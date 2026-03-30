@@ -39,7 +39,9 @@ class TrainingLogger:
             'metadata': {
                 'experiment_name': experiment_name,
                 'start_time': datetime.now().isoformat(),
-                'timestamp': self.timestamp
+                'timestamp': self.timestamp,
+                'model_params_total': None,
+                'model_params_trainable': None
             },
             'epochs': []
         }
@@ -49,6 +51,7 @@ class TrainingLogger:
         self.val_metrics_csv = self.experiment_dir / 'val_metrics.csv'
         self.summary_csv = self.experiment_dir / 'training_summary.csv'
         self.moe_stats_csv = self.experiment_dir / 'moe_stats.csv'
+        self.runtime_txt = self.experiment_dir / 'model_runtime_summary.txt'
         
         # JSON file
         self.history_json = self.experiment_dir / 'training_history.json'
@@ -59,7 +62,18 @@ class TrainingLogger:
         print(f"Timestamp: {self.timestamp}")
         print(f"{'='*80}\n")
     
-    def log_epoch(self, epoch, train_losses, val_results_df, learning_rate, epoch_time=None, adaptive_weights=None, moe_stats=None):
+    def log_epoch(
+        self,
+        epoch,
+        train_losses,
+        val_results_df,
+        learning_rate,
+        epoch_time=None,
+        train_time=None,
+        inference_time=None,
+        adaptive_weights=None,
+        moe_stats=None
+    ):
         """
         Log metrics for one epoch.
         
@@ -76,6 +90,8 @@ class TrainingLogger:
             'timestamp': datetime.now().isoformat(),
             'learning_rate': learning_rate,
             'epoch_time': epoch_time,
+            'train_time': train_time,
+            'inference_time': inference_time,
             'train_losses': {},
             'val_metrics': {}
         }
@@ -123,6 +139,7 @@ class TrainingLogger:
         # Also save a human-readable validation summary (per-epoch)
         self._save_summary_csv()
         self._save_moe_stats_csv()
+        self._save_runtime_summary_txt()
     
     def _save_json(self):
         """Save complete history as JSON."""
@@ -210,7 +227,9 @@ class TrainingLogger:
                 'epoch': epoch_data['epoch'],
                 'timestamp': epoch_data['timestamp'],
                 'learning_rate': epoch_data['learning_rate'],
-                'epoch_time': epoch_data.get('epoch_time')
+                'epoch_time': epoch_data.get('epoch_time'),
+                'train_time': epoch_data.get('train_time'),
+                'inference_time': epoch_data.get('inference_time')
             }
             
             # Average train loss across all tasks
@@ -294,11 +313,108 @@ class TrainingLogger:
             df = pd.DataFrame(rows)
             df.to_csv(self.moe_stats_csv, index=False, encoding='utf-8')
 
-    def _save_best_model_summary_txt(self, best_model_eval_on_train=None):
-        """Save a human-readable validation summary for the latest epoch.
+    def set_model_stats(self, total_params, trainable_params=None):
+        """Record model parameter statistics."""
+        total_params = int(total_params) if total_params is not None else None
+        trainable_params = int(trainable_params) if trainable_params is not None else None
+        self.history['metadata']['model_params_total'] = total_params
+        self.history['metadata']['model_params_trainable'] = trainable_params
+        self._save_runtime_summary_txt()
+        self._save_json()
+
+    @staticmethod
+    def _format_seconds(seconds):
+        if seconds is None:
+            return "N/A"
+        return f"{float(seconds):.2f}s"
+
+    def _get_runtime_stats(self):
+        """Aggregate runtime statistics from epoch history."""
+        epoch_times = []
+        train_times = []
+        inference_times = []
+
+        for epoch_data in self.history.get('epochs', []):
+            epoch_time = epoch_data.get('epoch_time')
+            train_time = epoch_data.get('train_time')
+            inference_time = epoch_data.get('inference_time')
+            if epoch_time is not None:
+                epoch_times.append(float(epoch_time))
+            if train_time is not None:
+                train_times.append(float(train_time))
+            if inference_time is not None:
+                inference_times.append(float(inference_time))
+
+        def _safe_mean(values):
+            return float(np.mean(values)) if values else None
+
+        return {
+            'total_epoch_time': float(np.sum(epoch_times)) if epoch_times else None,
+            'total_train_time': float(np.sum(train_times)) if train_times else None,
+            'total_inference_time': float(np.sum(inference_times)) if inference_times else None,
+            'avg_epoch_time': _safe_mean(epoch_times),
+            'avg_train_time': _safe_mean(train_times),
+            'avg_inference_time': _safe_mean(inference_times),
+            'num_epochs_with_time': len(epoch_times),
+            'num_epochs_with_train_time': len(train_times),
+            'num_epochs_with_inference_time': len(inference_times),
+        }
+
+    def _save_runtime_summary_txt(self):
+        """Save model parameter count and runtime statistics to txt."""
+        metadata = self.history.get('metadata', {})
+        runtime = self._get_runtime_stats()
+        total_params = metadata.get('model_params_total')
+        trainable_params = metadata.get('model_params_trainable')
+        non_trainable_params = (
+            total_params - trainable_params
+            if total_params is not None and trainable_params is not None
+            else None
+        )
+
+        lines = []
+        lines.append(f"{'='*80}")
+        lines.append(f"Model and Runtime Summary - {self.experiment_name}")
+        lines.append(f"{'='*80}")
+        lines.append(f"Generated At: {datetime.now().isoformat()}")
+        lines.append("")
+        lines.append("Model Parameters:")
+        lines.append(
+            f"  - Total Parameters: {f'{int(total_params):,}' if total_params is not None else 'N/A'}"
+        )
+        lines.append(
+            f"  - Trainable Parameters: {f'{int(trainable_params):,}' if trainable_params is not None else 'N/A'}"
+        )
+        lines.append(
+            f"  - Non-trainable Parameters: {f'{int(non_trainable_params):,}' if non_trainable_params is not None else 'N/A'}"
+        )
+        lines.append("")
+        lines.append("Runtime:")
+        lines.append(f"  - Total Training Time: {self._format_seconds(runtime.get('total_train_time'))}")
+        lines.append(f"  - Total Inference Time: {self._format_seconds(runtime.get('total_inference_time'))}")
+        lines.append(f"  - Total Epoch Time: {self._format_seconds(runtime.get('total_epoch_time'))}")
+        lines.append(f"  - Avg Training Time / Epoch: {self._format_seconds(runtime.get('avg_train_time'))}")
+        lines.append(f"  - Avg Inference Time / Epoch: {self._format_seconds(runtime.get('avg_inference_time'))}")
+        lines.append(f"  - Avg Epoch Time: {self._format_seconds(runtime.get('avg_epoch_time'))}")
+        lines.append(
+            f"  - Epochs with Timing: train={runtime.get('num_epochs_with_train_time', 0)}, "
+            f"inference={runtime.get('num_epochs_with_inference_time', 0)}, "
+            f"epoch_total={runtime.get('num_epochs_with_time', 0)}"
+        )
+
+        try:
+            with open(self.runtime_txt, 'w', encoding='utf-8') as f:
+                for line in lines:
+                    f.write(line + "\n")
+        except Exception as e:
+            print(f"Could not write {self.runtime_txt.name}: {e}")
+
+    def _save_best_model_summary_txt(self, best_model_eval_on_train=None, best_epoch=None):
+        """Save a human-readable validation summary for best epoch (and last epoch for comparison).
 
         This writes `best_model_summary.txt` in the experiment directory containing:
-          - Per-task validation metrics for the most recent epoch
+          - Per-task validation metrics for the best epoch
+          - Optional per-task validation metrics for the last epoch (comparison)
           - Mean primary metric for the four high-level task groups:
             classification, segmentation, detection, regression
           - Best model evaluation on the training set (if provided)
@@ -306,102 +422,137 @@ class TrainingLogger:
         if not self.history['epochs']:
             return
 
-        last_epoch = self.history['epochs'][-1]
-        epoch = last_epoch['epoch']
-        timestamp = last_epoch['timestamp']
+        def _append_epoch_section(lines_ref, epoch_data, section_title):
+            if 'val_metrics' not in epoch_data or not epoch_data['val_metrics']:
+                lines_ref.append(f"{section_title}: N/A (no validation metrics)")
+                lines_ref.append("")
+                return
 
-        if 'val_metrics' not in last_epoch or not last_epoch['val_metrics']:
-            return
+            lines_ref.append(section_title)
+            lines_ref.append(f"Epoch: {epoch_data.get('epoch', 'N/A')}")
+            lines_ref.append(f"Timestamp: {epoch_data.get('timestamp', 'N/A')}")
+            lines_ref.append("")
+            lines_ref.append("Per-task validation metrics:")
+            lines_ref.append("")
 
-        lines = []
-        lines.append(f"Validation Summary - Best Epoch {epoch}")
-        lines.append(f"Timestamp: {timestamp}")
-        lines.append("")
-        lines.append("Per-task validation metrics of Best Epoch:")
-        lines.append("")
+            group_names = ['classification', 'segmentation', 'detection', 'regression']
+            group_vals = {g: [] for g in group_names}
+            classification_metrics = {'Accuracy': [], 'F1-Score': []}
 
-        # Collect per-task lines and also group metrics
-        group_names = ['classification', 'segmentation', 'detection', 'regression']
-        group_vals = {g: [] for g in group_names}
-        classification_metrics = {'Accuracy': [], 'F1-Score': []}
+            def _first_present(metrics_dict, keys):
+                for key in keys:
+                    if key in metrics_dict and metrics_dict[key] is not None:
+                        return metrics_dict[key]
+                return None
 
-        for task_id in sorted(last_epoch['val_metrics'].keys(), key=lambda x: int(x) if str(x).isdigit() else str(x)):
-            task_data = last_epoch['val_metrics'][task_id]
-            task_name = task_data.get('task_name', '')
-            metrics = task_data.get('metrics', {})
+            for task_id in sorted(epoch_data['val_metrics'].keys(), key=lambda x: int(x) if str(x).isdigit() else str(x)):
+                task_data = epoch_data['val_metrics'][task_id]
+                task_name = task_data.get('task_name', '')
+                metrics = task_data.get('metrics', {})
 
-            # Format per-task line
-            metric_parts = []
-            for k, v in metrics.items():
-                if v is None:
-                    metric_parts.append(f"{k}: N/A")
-                else:
-                    try:
-                        metric_parts.append(f"{k}: {float(v):.4f}")
-                    except Exception:
-                        metric_parts.append(f"{k}: {v}")
-
-            lines.append(f"  - Task {task_id} | {task_name} -> " + ", ".join(metric_parts))
-
-            # Determine group membership (simple substring match)
-            tn = str(task_name).lower()
-            for g in group_names:
-                if g in tn:
-                    # Select primary metric per group
-                    if g == 'classification':
-                        acc = metrics.get('Accuracy')
-                        f1 = metrics.get('F1-Score')
-                        if acc is not None:
-                            try:
-                                classification_metrics['Accuracy'].append(float(acc))
-                            except Exception:
-                                pass
-                        if f1 is not None:
-                            try:
-                                classification_metrics['F1-Score'].append(float(f1))
-                            except Exception:
-                                pass
-                    elif g == 'segmentation':
-                        val = metrics.get('Dice') or metrics.get('IoU')
-                    elif g == 'detection':
-                        val = metrics.get('IoU')
-                    else:  # regression
-                        val = metrics.get('MAE') or metrics.get('MAE (pixels)')
-
-                    if val is not None and g != 'classification':  # Skip classification here since it's handled separately
+                metric_parts = []
+                for k, v in metrics.items():
+                    if v is None:
+                        metric_parts.append(f"{k}: N/A")
+                    else:
                         try:
-                            group_vals[g].append(float(val))
+                            metric_parts.append(f"{k}: {float(v):.4f}")
                         except Exception:
-                            pass
+                            metric_parts.append(f"{k}: {v}")
 
-        lines.append("")
-        lines.append("Group mean primary metrics:")
-        for g in group_names:
-            if g == 'classification':  # Special handling for classification
-                acc_vals = classification_metrics['Accuracy']
-                f1_vals = classification_metrics['F1-Score']
-                if acc_vals:
-                    mean_acc = float(np.mean(acc_vals))
-                    lines.append(f"  - Classification Accuracy: {mean_acc:.4f} (mean over {len(acc_vals)} task(s))")
-                else:
-                    lines.append(f"  - Classification Accuracy: N/A (no tasks found)")
-                if f1_vals:
-                    mean_f1 = float(np.mean(f1_vals))
-                    lines.append(f"  - Classification F1-Score: {mean_f1:.4f} (mean over {len(f1_vals)} task(s))")
-                else:
-                    lines.append(f"  - Classification F1-Score: N/A (no tasks found)")
+                lines_ref.append(f"  - Task {task_id} | {task_name} -> " + ", ".join(metric_parts))
+
+                tn = str(task_name).lower()
+                for g in group_names:
+                    if g in tn:
+                        if g == 'classification':
+                            acc = metrics.get('Accuracy')
+                            f1 = metrics.get('F1-Score')
+                            if acc is not None:
+                                try:
+                                    classification_metrics['Accuracy'].append(float(acc))
+                                except Exception:
+                                    pass
+                            if f1 is not None:
+                                try:
+                                    classification_metrics['F1-Score'].append(float(f1))
+                                except Exception:
+                                    pass
+                        elif g == 'segmentation':
+                            val = _first_present(metrics, ['Dice', 'IoU'])
+                            if val is not None:
+                                try:
+                                    group_vals[g].append(float(val))
+                                except Exception:
+                                    pass
+                        elif g == 'detection':
+                            val = metrics.get('IoU')
+                            if val is not None:
+                                try:
+                                    group_vals[g].append(float(val))
+                                except Exception:
+                                    pass
+                        else:  # regression
+                            val = _first_present(metrics, ['MAE', 'MAE (pixels)'])
+                            if val is not None:
+                                try:
+                                    group_vals[g].append(float(val))
+                                except Exception:
+                                    pass
+
+            lines_ref.append("")
+            lines_ref.append("Group mean primary metrics:")
+            acc_vals = classification_metrics['Accuracy']
+            f1_vals = classification_metrics['F1-Score']
+            if acc_vals:
+                mean_acc = float(np.mean(acc_vals))
+                lines_ref.append(f"  - Classification Accuracy: {mean_acc:.4f} (mean over {len(acc_vals)} task(s))")
             else:
+                lines_ref.append("  - Classification Accuracy: N/A (no tasks found)")
+            if f1_vals:
+                mean_f1 = float(np.mean(f1_vals))
+                lines_ref.append(f"  - Classification F1-Score: {mean_f1:.4f} (mean over {len(f1_vals)} task(s))")
+            else:
+                lines_ref.append("  - Classification F1-Score: N/A (no tasks found)")
+
+            for g in ['segmentation', 'detection', 'regression']:
                 vals = group_vals[g]
                 if vals:
                     mean_val = float(np.mean(vals))
-                    # For regression-like groups lower is better; keep numeric value
-                    lines.append(f"  - {g.title()}: {mean_val:.4f} (mean over {len(vals)} task(s))")
+                    lines_ref.append(f"  - {g.title()}: {mean_val:.4f} (mean over {len(vals)} task(s))")
                 else:
-                    lines.append(f"  - {g.title()}: N/A (no tasks found)")
+                    lines_ref.append(f"  - {g.title()}: N/A (no tasks found)")
+            lines_ref.append("")
+
+        # Resolve best epoch entry from history
+        best_epoch_data = None
+        used_best_epoch_fallback = False
+        if best_epoch is not None:
+            for e in self.history['epochs']:
+                if e.get('epoch') == best_epoch:
+                    best_epoch_data = e
+                    break
+        if best_epoch_data is None:
+            best_epoch_data = self.history['epochs'][-1]
+            used_best_epoch_fallback = (best_epoch is not None)
+
+        last_epoch_data = self.history['epochs'][-1]
+
+        lines = []
+        lines.append("Validation Summary")
+        if used_best_epoch_fallback:
+            lines.append(
+                f"Warning: requested best_epoch={best_epoch} not found in history; "
+                "falling back to last epoch metrics."
+            )
+        lines.append("")
+        _append_epoch_section(lines, best_epoch_data, "Best Epoch Validation Metrics")
+
+        if last_epoch_data.get('epoch') != best_epoch_data.get('epoch'):
+            _append_epoch_section(lines, last_epoch_data, "Last Epoch Validation Metrics (for comparison)")
 
         # Add best model evaluation on training set if provided
         if best_model_eval_on_train:
-            lines.append("")
             lines.append("Best Model Evaluation on Training Set:")
             for task_group, score in best_model_eval_on_train.items():
                 if isinstance(score, dict):
@@ -432,6 +583,8 @@ class TrainingLogger:
     
     def save_final_summary(self, best_epoch, best_score):
         """Save final training summary."""
+        runtime = self._get_runtime_stats()
+        metadata = self.history.get('metadata', {})
         summary = {
             'experiment_name': self.experiment_name,
             'start_time': self.history['metadata']['start_time'],
@@ -439,6 +592,11 @@ class TrainingLogger:
             'total_epochs': len(self.history['epochs']),
             'best_epoch': best_epoch,
             'best_validation_score': best_score,
+            'model_params_total': metadata.get('model_params_total'),
+            'model_params_trainable': metadata.get('model_params_trainable'),
+            'total_train_time': runtime.get('total_train_time'),
+            'total_inference_time': runtime.get('total_inference_time'),
+            'total_epoch_time': runtime.get('total_epoch_time'),
             'timestamp': self.timestamp
         }
         
@@ -457,6 +615,25 @@ class TrainingLogger:
             f.write(f"Total Epochs: {summary['total_epochs']}\n")
             f.write(f"Best Epoch: {summary['best_epoch']}\n")
             f.write(f"Best Validation Score: {summary['best_validation_score']:.4f}\n")
+            model_total = summary.get('model_params_total')
+            model_trainable = summary.get('model_params_trainable')
+            model_non_trainable = (
+                model_total - model_trainable
+                if model_total is not None and model_trainable is not None
+                else None
+            )
+            f.write(
+                f"Model Parameters (Total): {f'{int(model_total):,}' if model_total is not None else 'N/A'}\n"
+            )
+            f.write(
+                f"Model Parameters (Trainable): {f'{int(model_trainable):,}' if model_trainable is not None else 'N/A'}\n"
+            )
+            f.write(
+                f"Model Parameters (Non-trainable): {f'{int(model_non_trainable):,}' if model_non_trainable is not None else 'N/A'}\n"
+            )
+            f.write(f"Total Training Time: {self._format_seconds(summary.get('total_train_time'))}\n")
+            f.write(f"Total Inference Time: {self._format_seconds(summary.get('total_inference_time'))}\n")
+            f.write(f"Total Epoch Time: {self._format_seconds(summary.get('total_epoch_time'))}\n")
             f.write(f"\nLog Directory: {self.experiment_dir}\n")
             f.write(f"\nGenerated Files:\n")
             f.write(f"  - training_history.json (complete history)\n")
@@ -464,7 +641,10 @@ class TrainingLogger:
             f.write(f"  - val_metrics.csv (validation metrics per task per epoch)\n")
             f.write(f"  - training_summary.csv (summary metrics per epoch)\n")
             f.write(f"  - moe_stats.csv (MoE importance/load per task)\n")
+            f.write(f"  - model_runtime_summary.txt (model parameters and runtime summary)\n")
             f.write(f"  - config.yaml (training configuration)\n")
+
+        self._save_runtime_summary_txt()
         
         print(f"\n{'='*80}")
         print(f"Training logs saved to: {self.experiment_dir}")

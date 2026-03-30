@@ -8,6 +8,8 @@ from .heads import build_all_heads
 from .moe import MoEConvBlock
 from .film_layer import TaskFiLMGenerator, TaskEmbeddingFiLMGenerator, FiLMLayer
 from .task_prompt import TaskPrompt2D
+from .task_condition import TaskConditionEncoder
+from .prompt_modulators import EncoderFeaturePromptModulator
 
 
 class MultiTaskModel(nn.Module):
@@ -27,14 +29,56 @@ class MultiTaskModel(nn.Module):
         
         self.config = config
         self.task_configs = config.get_task_configs()
+
+        # Parse task prompt config early because concat mode changes encoder input channels.
+        task_prompt_cfg = config.get('model.task_prompt', {}) or {}
+        self.use_task_prompt = bool(task_prompt_cfg.get('enabled', False))
+        self.task_prompt_inject_mode = str(task_prompt_cfg.get('inject_mode', 'add')).lower()
+        self.task_prompt_channels = int(task_prompt_cfg.get('channels', 1))
+        self.task_prompt_use_task_name = bool(task_prompt_cfg.get('use_task_name', True))
+        self.task_prompt_use_organ = bool(task_prompt_cfg.get('use_organ', True))
+        self.task_prompt_use_num_classes = bool(task_prompt_cfg.get('use_num_classes', False))
+        apply_task_names = task_prompt_cfg.get('apply_to_task_names', None)
+        if apply_task_names is None:
+            self.task_prompt_apply_task_names = None
+        else:
+            self.task_prompt_apply_task_names = {str(name).lower() for name in apply_task_names}
+        self.encoder_input_channels = 3
+        if self.use_task_prompt and self.task_prompt_inject_mode == "concat":
+            self.encoder_input_channels = 3 + self.task_prompt_channels
+
+        # Parse encoder-feature prompt config (task-conditioned modulation after encoder output).
+        feature_prompt_cfg = config.get('model.feature_prompt', {}) or {}
+        self.use_feature_prompt = bool(feature_prompt_cfg.get('enabled', False))
+        self.feature_prompt_condition_source = str(feature_prompt_cfg.get('condition_source', 'task_type_only'))
+        self.feature_prompt_condition_dim = int(feature_prompt_cfg.get('condition_dim', 128))
+        feature_prompt_hidden_dim = feature_prompt_cfg.get('hidden_dim', None)
+        self.feature_prompt_hidden_dim = (
+            int(feature_prompt_hidden_dim) if feature_prompt_hidden_dim is not None else None
+        )
+        self.feature_prompt_init_scale = float(feature_prompt_cfg.get('init_scale', 0.1))
+        self.feature_prompt_apply_stages = feature_prompt_cfg.get('apply_stages', None)
+
+        # Parse prompt-aware decoder config (decoder-internal cross-attention)
+        prompt_fpn_cfg = config.get('model.prompt_fpn', {}) or {}
+        prompt_decoder_backend = str(prompt_fpn_cfg.get('decoder_backend', 'base_fpn')).lower()
+        self.use_prompt_fpn = bool(prompt_fpn_cfg.get('enabled', False)) and prompt_decoder_backend == 'prompt_fpn'
+        self.prompt_fpn_condition_source = str(prompt_fpn_cfg.get('condition_source', 'task_type_only'))
+        self.prompt_fpn_condition_dim = int(prompt_fpn_cfg.get('condition_dim', 128))
+        prompt_fpn_hidden_dim = prompt_fpn_cfg.get('hidden_dim', None)
+        self.prompt_fpn_hidden_dim = int(prompt_fpn_hidden_dim) if prompt_fpn_hidden_dim is not None else None
         
         # Build encoder
         task_ids = [cfg['task_id'] for cfg in self.task_configs]
-        self.encoder = build_encoder(config, task_ids=task_ids)
+        self.encoder = build_encoder(config, task_ids=task_ids, input_channels=self.encoder_input_channels)
         
         # Normalize encoder channel metadata to [in, c1, c2, ...]
         raw_channels = list(self.encoder.out_channels)
-        encoder_channels = raw_channels if (raw_channels and raw_channels[0] == 3) else [3] + raw_channels
+        encoder_channels = (
+            raw_channels
+            if (raw_channels and raw_channels[0] == self.encoder_input_channels)
+            else [self.encoder_input_channels] + raw_channels
+        )
         
         # Build decoders
         decoders = build_decoders(self.encoder, config)
@@ -79,13 +123,6 @@ class MultiTaskModel(nn.Module):
             )
 
         # Build TaskPrompt modulation (optional, input-level)
-        task_prompt_cfg = config.get('model.task_prompt', {}) or {}
-        self.use_task_prompt = bool(task_prompt_cfg.get('enabled', False))
-        apply_task_names = task_prompt_cfg.get('apply_to_task_names', None)
-        if apply_task_names is None:
-            self.task_prompt_apply_task_names = None
-        else:
-            self.task_prompt_apply_task_names = {str(name).lower() for name in apply_task_names}
         if self.use_task_prompt:
             if hasattr(config, 'tasks_from_dataset') and not config.tasks_from_dataset():
                 raise ValueError(
@@ -94,21 +131,74 @@ class MultiTaskModel(nn.Module):
                 )
             self.task_prompt = TaskPrompt2D(
                 task_configs=self.task_configs,
-                out_channels=int(task_prompt_cfg.get('channels', 1)),
+                out_channels=self.task_prompt_channels,
                 prompt_size=int(task_prompt_cfg.get('prompt_size', 32)),
-                inject_mode=str(task_prompt_cfg.get('inject_mode', 'add')).lower(),
+                inject_mode=self.task_prompt_inject_mode,
                 init_scale=float(task_prompt_cfg.get('init_scale', 0.1)),
                 use_tanh=bool(task_prompt_cfg.get('use_tanh', True)),
+                use_task_name=self.task_prompt_use_task_name,
+                use_organ=self.task_prompt_use_organ,
+                use_num_classes=self.task_prompt_use_num_classes,
             )
             print(
                 "Using TaskPrompt2D "
                 f"(dim={self.task_prompt.prompt_dim}, prompt_size={self.task_prompt.prompt_size}, "
                 f"mode={self.task_prompt.inject_mode})"
             )
+            print(f"TaskPrompt2D metadata components: {self.task_prompt.vocab_info.get('enabled_components', [])}")
+            if self.task_prompt.inject_mode == "concat":
+                print(f"TaskPrompt2D concat mode enabled: encoder input channels = {self.encoder_input_channels}")
             if self.task_prompt_apply_task_names is None:
                 print("TaskPrompt2D apply scope: all task types")
             else:
                 print(f"TaskPrompt2D apply scope: {sorted(self.task_prompt_apply_task_names)}")
+
+        # Build encoder-feature prompt modulation (optional, encoder output-level)
+        self.task_condition_encoder = None
+        self.prompt_fpn_condition_encoder = None
+        if self.use_feature_prompt:
+            encoder_feature_channels = list(encoder_channels[1:])
+            self.task_condition_encoder = TaskConditionEncoder(
+                task_configs=self.task_configs,
+                condition_dim=self.feature_prompt_condition_dim,
+                condition_source=self.feature_prompt_condition_source,
+                hidden_dim=self.feature_prompt_hidden_dim,
+            )
+            self.encoder_feature_prompt = EncoderFeaturePromptModulator(
+                feature_channels=encoder_feature_channels,
+                condition_dim=self.feature_prompt_condition_dim,
+                init_scale=self.feature_prompt_init_scale,
+                apply_stages=self.feature_prompt_apply_stages,
+            )
+            print(
+                "Using encoder-feature prompt modulation "
+                f"(source={self.task_condition_encoder.condition_source}, "
+                f"cond_dim={self.feature_prompt_condition_dim}, "
+                f"stages={sorted(self.encoder_feature_prompt.apply_stage_indices)})"
+            )
+
+        # Build condition encoder for prompt-aware decoder (optional).
+        if self.use_prompt_fpn:
+            can_share_condition_encoder = (
+                self.use_feature_prompt
+                and self.feature_prompt_condition_source == self.prompt_fpn_condition_source
+                and self.feature_prompt_condition_dim == self.prompt_fpn_condition_dim
+                and self.feature_prompt_hidden_dim == self.prompt_fpn_hidden_dim
+            )
+            if can_share_condition_encoder:
+                self.prompt_fpn_condition_encoder = self.task_condition_encoder
+            else:
+                self.prompt_fpn_condition_encoder = TaskConditionEncoder(
+                    task_configs=self.task_configs,
+                    condition_dim=self.prompt_fpn_condition_dim,
+                    condition_source=self.prompt_fpn_condition_source,
+                    hidden_dim=self.prompt_fpn_hidden_dim,
+                )
+            print(
+                "Using PromptFPN decoder conditioning "
+                f"(source={self.prompt_fpn_condition_encoder.condition_source}, "
+                f"cond_dim={self.prompt_fpn_condition_dim})"
+            )
 
         # Build MoE blocks (optional)
         moe_cfg = config.get('model.moe', {}) or {}
@@ -197,6 +287,8 @@ class MultiTaskModel(nn.Module):
 
         if use_task_prompt_for_current:
             x = self.task_prompt.apply(x, task_id)
+        elif self.use_task_prompt and self.task_prompt.inject_mode == "concat":
+            x = self.task_prompt.concat_zeros(x)
         
         # Encode features
         if getattr(self.encoder, "supports_task_id", False):
@@ -205,10 +297,39 @@ class MultiTaskModel(nn.Module):
             features = self.encoder(x)
         if self.use_moe:
             features = self._apply_moe(features, task_id)
+        if self.use_feature_prompt:
+            feature_dtype = x.dtype
+            if isinstance(features, (list, tuple)) and len(features) > 0:
+                feature_dtype = features[0].dtype
+            cond_vec = self.task_condition_encoder(
+                task_id=task_id,
+                batch_size=x.shape[0],
+                device=x.device,
+                dtype=feature_dtype,
+            )
+            features = self.encoder_feature_prompt(features, cond_vec)
+
+        prompt_cond_vec = None
+        if self.use_prompt_fpn:
+            feature_dtype = x.dtype
+            if isinstance(features, (list, tuple)) and len(features) > 0:
+                feature_dtype = features[0].dtype
+            if self.task_condition_encoder is not None and self.prompt_fpn_condition_encoder is self.task_condition_encoder:
+                prompt_cond_vec = cond_vec
+            else:
+                prompt_cond_vec = self.prompt_fpn_condition_encoder(
+                    task_id=task_id,
+                    batch_size=x.shape[0],
+                    device=x.device,
+                    dtype=feature_dtype,
+                )
         
         # Route through appropriate decoder and head
         if task_name == 'segmentation':
-            fpn_features = self.fpn_decoder_seg(features)
+            if self.use_prompt_fpn:
+                fpn_features = self.fpn_decoder_seg(features, prompt_cond_vec)
+            else:
+                fpn_features = self.fpn_decoder_seg(features)
             
             # Apply FiLM modulation if enabled
             if self.use_film:
@@ -218,7 +339,10 @@ class MultiTaskModel(nn.Module):
             output = self.heads[task_id](fpn_features)
         
         elif task_name == 'detection':
-            fpn_features = self.fpn_decoder_det(features)
+            if self.use_prompt_fpn:
+                fpn_features = self.fpn_decoder_det(features, prompt_cond_vec)
+            else:
+                fpn_features = self.fpn_decoder_det(features)
             
             # Apply FiLM modulation if enabled
             if self.use_film:
@@ -229,7 +353,10 @@ class MultiTaskModel(nn.Module):
         
         elif task_name == 'classification':
             if self.use_fpn_for_cls:
-                fpn_features = self.fpn_decoder_cls(features)
+                if self.use_prompt_fpn:
+                    fpn_features = self.fpn_decoder_cls(features, prompt_cond_vec)
+                else:
+                    fpn_features = self.fpn_decoder_cls(features)
                 if self.use_film:
                     gamma, beta = self.film_generator(task_id)
                     fpn_features = self.film_layer(fpn_features, condition=(gamma, beta))
@@ -239,7 +366,10 @@ class MultiTaskModel(nn.Module):
 
         else:  # regression
             if self.use_fpn_for_reg:
-                fpn_features = self.fpn_decoder_reg(features)
+                if self.use_prompt_fpn:
+                    fpn_features = self.fpn_decoder_reg(features, prompt_cond_vec)
+                else:
+                    fpn_features = self.fpn_decoder_reg(features)
                 if self.use_film:
                     gamma, beta = self.film_generator(task_id)
                     fpn_features = self.film_layer(fpn_features, condition=(gamma, beta))
@@ -304,6 +434,12 @@ class MultiTaskModel(nn.Module):
         head_params += list(self.heads.parameters())
         if self.use_task_prompt:
             head_params += list(self.task_prompt.parameters())
+        if self.use_feature_prompt:
+            head_params += list(self.task_condition_encoder.parameters())
+            head_params += list(self.encoder_feature_prompt.parameters())
+        if self.use_prompt_fpn and self.prompt_fpn_condition_encoder is not None:
+            if self.prompt_fpn_condition_encoder is not self.task_condition_encoder:
+                head_params += list(self.prompt_fpn_condition_encoder.parameters())
         
         return encoder_params, head_params
 
@@ -318,6 +454,16 @@ class MultiTaskModel(nn.Module):
                 if aux is not None:
                     total = total + aux
         return total
+
+    def set_current_epoch(self, epoch: int) -> None:
+        """Propagate current epoch to modules that need epoch-scoped logging."""
+        seen = set()
+        for decoder in [self.fpn_decoder_seg, self.fpn_decoder_det, self.fpn_decoder_cls, self.fpn_decoder_reg]:
+            if id(decoder) in seen:
+                continue
+            seen.add(id(decoder))
+            if hasattr(decoder, "set_current_epoch"):
+                decoder.set_current_epoch(epoch)
 
     def get_moe_stats(self):
         stats = []
