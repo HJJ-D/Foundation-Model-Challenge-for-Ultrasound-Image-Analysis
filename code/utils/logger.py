@@ -244,7 +244,8 @@ class TrainingLogger:
                 all_dice_scores = []
                 all_ious = []
                 all_maes = []
-                
+                all_mae_stds = []
+
                 for task_data in epoch_data['val_metrics'].values():
                     metrics = task_data['metrics']
                     if 'Accuracy' in metrics and metrics['Accuracy'] is not None:
@@ -257,12 +258,15 @@ class TrainingLogger:
                         all_ious.append(metrics['IoU'])
                     if 'MAE (pixels)' in metrics and metrics['MAE (pixels)'] is not None:
                         all_maes.append(metrics['MAE (pixels)'])
-                
+                    if 'MAE_std (pixels)' in metrics and metrics['MAE_std (pixels)'] is not None:
+                        all_mae_stds.append(metrics['MAE_std (pixels)'])
+
                 row['avg_accuracy'] = np.mean(all_accuracies) if all_accuracies else None
                 row['avg_f1_score'] = np.mean(all_f1_scores) if all_f1_scores else None
                 row['avg_dice'] = np.mean(all_dice_scores) if all_dice_scores else None
                 row['avg_iou'] = np.mean(all_ious) if all_ious else None
                 row['avg_mae'] = np.mean(all_maes) if all_maes else None
+                row['avg_mae_std'] = np.mean(all_mae_stds) if all_mae_stds else None
             
             rows.append(row)
         
@@ -437,6 +441,7 @@ class TrainingLogger:
 
             group_names = ['classification', 'segmentation', 'detection', 'regression']
             group_vals = {g: [] for g in group_names}
+            regression_stds = []   # per-task MAE_std values for the regression group
             classification_metrics = {'Accuracy': [], 'F1-Score': []}
 
             def _first_present(metrics_dict, keys):
@@ -499,6 +504,12 @@ class TrainingLogger:
                                     group_vals[g].append(float(val))
                                 except Exception:
                                     pass
+                            std_val = metrics.get('MAE_std (pixels)')
+                            if std_val is not None:
+                                try:
+                                    regression_stds.append(float(std_val))
+                                except Exception:
+                                    pass
 
             lines_ref.append("")
             lines_ref.append("Group mean primary metrics:")
@@ -515,13 +526,28 @@ class TrainingLogger:
             else:
                 lines_ref.append("  - Classification F1-Score: N/A (no tasks found)")
 
-            for g in ['segmentation', 'detection', 'regression']:
+            for g in ['segmentation', 'detection']:
                 vals = group_vals[g]
                 if vals:
                     mean_val = float(np.mean(vals))
                     lines_ref.append(f"  - {g.title()}: {mean_val:.4f} (mean over {len(vals)} task(s))")
                 else:
                     lines_ref.append(f"  - {g.title()}: N/A (no tasks found)")
+
+            # Regression: show MAE ± STD
+            reg_vals = group_vals['regression']
+            if reg_vals:
+                mean_mae = float(np.mean(reg_vals))
+                if regression_stds:
+                    mean_std = float(np.mean(regression_stds))
+                    lines_ref.append(
+                        f"  - Regression: MAE={mean_mae:.4f} ± STD={mean_std:.4f}"
+                        f" (mean over {len(reg_vals)} task(s))"
+                    )
+                else:
+                    lines_ref.append(f"  - Regression: MAE={mean_mae:.4f} (mean over {len(reg_vals)} task(s))")
+            else:
+                lines_ref.append("  - Regression: N/A (no tasks found)")
             lines_ref.append("")
 
         # Resolve best epoch entry from history
@@ -556,11 +582,18 @@ class TrainingLogger:
             lines.append("Best Model Evaluation on Training Set:")
             for task_group, score in best_model_eval_on_train.items():
                 if isinstance(score, dict):
-                    acc = score.get("Accuracy")
-                    f1 = score.get("F1-Score")
-                    acc_str = f"{acc:.4f}" if acc is not None else "N/A"
-                    f1_str = f"{f1:.4f}" if f1 is not None else "N/A"
-                    lines.append(f"  - {task_group.title()}: Accuracy={acc_str}, F1-Score={f1_str}")
+                    if task_group == 'regression':
+                        mae = score.get("MAE (pixels)")
+                        std = score.get("MAE_std (pixels)")
+                        mae_str = f"{mae:.4f}" if mae is not None else "N/A"
+                        std_str = f" ± {std:.4f}" if std is not None else ""
+                        lines.append(f"  - {task_group.title()}: MAE={mae_str}{std_str}")
+                    else:
+                        acc = score.get("Accuracy")
+                        f1 = score.get("F1-Score")
+                        acc_str = f"{acc:.4f}" if acc is not None else "N/A"
+                        f1_str = f"{f1:.4f}" if f1 is not None else "N/A"
+                        lines.append(f"  - {task_group.title()}: Accuracy={acc_str}, F1-Score={f1_str}")
                 elif score is not None:
                     lines.append(f"  - {task_group.title()}: {score:.4f}")
                 else:
@@ -635,6 +668,26 @@ class TrainingLogger:
             f.write(f"Total Inference Time: {self._format_seconds(summary.get('total_inference_time'))}\n")
             f.write(f"Total Epoch Time: {self._format_seconds(summary.get('total_epoch_time'))}\n")
             f.write(f"\nLog Directory: {self.experiment_dir}\n")
+
+            # Best-epoch regression summary (MAE ± STD)
+            best_epoch_data = next(
+                (e for e in self.history['epochs'] if e.get('epoch') == best_epoch), None
+            ) or (self.history['epochs'][-1] if self.history['epochs'] else None)
+            if best_epoch_data:
+                reg_maes, reg_stds = [], []
+                for task_data in best_epoch_data.get('val_metrics', {}).values():
+                    if 'regression' in str(task_data.get('task_name', '')).lower():
+                        m = task_data.get('metrics', {})
+                        if m.get('MAE (pixels)') is not None:
+                            reg_maes.append(float(m['MAE (pixels)']))
+                        if m.get('MAE_std (pixels)') is not None:
+                            reg_stds.append(float(m['MAE_std (pixels)']))
+                if reg_maes:
+                    mean_mae = float(np.mean(reg_maes))
+                    std_part = f" ± STD={float(np.mean(reg_stds)):.4f}" if reg_stds else ""
+                    f.write(f"Best Epoch Regression (val): MAE={mean_mae:.4f}{std_part}"
+                            f" (mean over {len(reg_maes)} task(s))\n")
+
             f.write(f"\nGenerated Files:\n")
             f.write(f"  - training_history.json (complete history)\n")
             f.write(f"  - train_losses.csv (training losses per epoch)\n")

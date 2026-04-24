@@ -83,7 +83,8 @@ class PromptAttentionBlock(nn.Module):
             print(
                 f"[PromptAttention][epoch {self._current_epoch + 1}] "
                 f"residual_scale={self.residual_scale.item():.4f}, "
-                f"gate_mean={gate.mean().item():.4f}"
+                f"gate_mean={gate.mean().item():.4f}",
+                flush=True,
             )
             self._last_logged_epoch = self._current_epoch
         return x + self.residual_scale * gate * delta

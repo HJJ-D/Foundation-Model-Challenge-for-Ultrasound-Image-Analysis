@@ -79,7 +79,7 @@ class Config:
         try:
             for k in keys:
                 value = value[k]
-            return value
+            return default if value is None else value
         except (KeyError, TypeError):
             return default
     

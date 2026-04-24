@@ -38,7 +38,12 @@ def calculate_dice_coefficient(y_true, y_pred_logits):
 
 
 def calculate_mae(y_true, y_pred, image_size=(224, 224)):
-    """Calculate mean absolute error for regression (in pixels)."""
+    """Calculate mean absolute error and std for regression (in pixels).
+
+    Returns:
+        tuple: (mean_mae, std_mae) — per-sample MAE mean and standard deviation.
+               std reflects prediction consistency across samples.
+    """
     h, w = image_size
     y_true_px = y_true.cpu().numpy().copy()
     y_pred_px = y_pred.cpu().numpy().copy()
@@ -46,7 +51,9 @@ def calculate_mae(y_true, y_pred, image_size=(224, 224)):
     y_true_px[:, 1::2] *= h
     y_pred_px[:, 0::2] *= w
     y_pred_px[:, 1::2] *= h
-    return np.mean(np.abs(y_true_px - y_pred_px))
+    abs_errors = np.abs(y_true_px - y_pred_px)   # [B, N*2]
+    per_sample_mae = abs_errors.mean(axis=1)       # [B] — one scalar per sample
+    return float(np.mean(per_sample_mae)), float(np.std(per_sample_mae))
 
 
 def calculate_iou(y_true, y_pred):
@@ -109,6 +116,10 @@ def evaluate(model, val_loader, device, task_configs):
                 # Handle deep supervision outputs (only use main output for evaluation)
                 if task_name == 'segmentation' and isinstance(outputs, tuple):
                     outputs = outputs[0]  # Use only the main output
+
+                # Handle DSNT outputs — use only the coordinate tensor for evaluation
+                if task_name == 'Regression' and isinstance(outputs, tuple):
+                    outputs = outputs[0]  # coords [B, N*2]; discard heatmaps
                 
                 if task_name == 'classification':
                     task_metrics[task_id]['Accuracy'].append(calculate_accuracy(task_labels, outputs))
@@ -119,9 +130,9 @@ def evaluate(model, val_loader, device, task_configs):
                 
                 elif task_name == 'Regression':
                     image_size = (task_images.shape[-2], task_images.shape[-1])
-                    task_metrics[task_id]['MAE (pixels)'].append(
-                        calculate_mae(task_labels, outputs, image_size=image_size)
-                    )
+                    mae_mean, mae_std = calculate_mae(task_labels, outputs, image_size=image_size)
+                    task_metrics[task_id]['MAE (pixels)'].append(mae_mean)
+                    task_metrics[task_id]['MAE_std (pixels)'].append(mae_std)
                 
                 elif task_name == 'detection':
                     if isinstance(outputs, dict) and 'heatmap' in outputs:

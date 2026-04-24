@@ -310,6 +310,122 @@ class CenterNetDetectionHead(nn.Module):
         }
 
 
+class DSNTRegressionHead(nn.Module):
+    """DSNT (Differentiable Spatial to Numerical Transform) head for keypoint regression.
+
+    Converts feature maps into probability heatmaps, then applies the DSNT transform
+    (spatial expected value) to obtain differentiable sub-pixel coordinate predictions.
+    An optional Jensen-Shannon divergence regularizer can be applied against a Gaussian
+    target heatmap during training.
+
+    Reference: Nibali et al., "Numerical Coordinate Regression with Convolutional
+    Neural Networks", arXiv:1801.07372 (2018).
+    """
+
+    def __init__(self, in_channels, num_points, mid_channels=128, heatmap_size=None):
+        """
+        Args:
+            in_channels:   Input feature channels (FPN output).
+            num_points:    Number of keypoints to predict.
+            mid_channels:  Intermediate conv channels.
+            heatmap_size:  Optional (H, W) to resize features before head; None = keep FPN size.
+        """
+        super().__init__()
+        self.num_points = num_points
+        self.heatmap_size = heatmap_size
+
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(_gn_groups(mid_channels), mid_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(mid_channels, mid_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(_gn_groups(mid_channels), mid_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(mid_channels, num_points, 1),
+        )
+
+    @staticmethod
+    def dsnt(heatmaps):
+        """Apply DSNT transform: heatmaps → coordinates.
+
+        Args:
+            heatmaps: [B, N, H, W] softmax-normalized probability maps.
+        Returns:
+            coords: [B, N*2] predicted (x, y) coordinates in [0, 1],
+                    interleaved as [x1, y1, x2, y2, ...].
+        """
+        B, N, H, W = heatmaps.shape
+        device = heatmaps.device
+        xs = torch.linspace(-1.0, 1.0, W, device=device)   # [W]
+        ys = torch.linspace(-1.0, 1.0, H, device=device)   # [H]
+        x_coords = (heatmaps * xs.view(1, 1, 1, W)).sum(dim=(2, 3))  # [B, N]
+        y_coords = (heatmaps * ys.view(1, 1, H, 1)).sum(dim=(2, 3))  # [B, N]
+        # Map [-1, 1] → [0, 1]
+        x_coords = (x_coords + 1.0) * 0.5
+        y_coords = (y_coords + 1.0) * 0.5
+        coords = torch.stack([x_coords, y_coords], dim=-1).reshape(B, N * 2)
+        return coords
+
+    @staticmethod
+    def make_gaussian_heatmaps(coords, H, W, sigma=0.07):
+        """Build normalized Gaussian target heatmaps from GT coordinates.
+
+        Args:
+            coords: [B, N*2] GT coordinates in [0, 1] (interleaved x, y).
+            H, W:   Heatmap spatial dimensions.
+            sigma:  Gaussian sigma in normalized [-1, 1] space.
+        Returns:
+            gaussians: [B, N, H, W] probability maps summing to 1 over H×W.
+        """
+        B = coords.shape[0]
+        N = coords.shape[1] // 2
+        device = coords.device
+        coords_xy = coords.reshape(B, N, 2)
+        mu_x = coords_xy[:, :, 0] * 2.0 - 1.0   # [B, N], in [-1, 1]
+        mu_y = coords_xy[:, :, 1] * 2.0 - 1.0   # [B, N]
+        xs = torch.linspace(-1.0, 1.0, W, device=device).view(1, 1, 1, W)
+        ys = torch.linspace(-1.0, 1.0, H, device=device).view(1, 1, H, 1)
+        mu_x = mu_x.view(B, N, 1, 1)
+        mu_y = mu_y.view(B, N, 1, 1)
+        gauss = torch.exp(-((xs - mu_x) ** 2 + (ys - mu_y) ** 2) / (2.0 * sigma ** 2))
+        gauss = gauss / (gauss.sum(dim=(-1, -2), keepdim=True) + 1e-8)
+        return gauss  # [B, N, H, W]
+
+    @staticmethod
+    def js_divergence(p, q, eps=1e-8):
+        """Jensen-Shannon divergence between two discrete probability distributions.
+
+        Args:
+            p, q: [B, N, H, W] probability maps (summing to 1 over H×W).
+        Returns:
+            Scalar mean JSD value.
+        """
+        m = 0.5 * (p + q)
+        kl_pm = (p * (torch.log(p + eps) - torch.log(m + eps))).sum(dim=(-1, -2))
+        kl_qm = (q * (torch.log(q + eps) - torch.log(m + eps))).sum(dim=(-1, -2))
+        return (0.5 * (kl_pm + kl_qm)).mean()
+
+    def forward(self, features):
+        """
+        Args:
+            features: FPN feature map [B, C, H, W] or list/tuple (last element used).
+        Returns:
+            coords:   [B, num_points*2] predicted coordinates in [0, 1].
+            heatmaps: [B, num_points, H, W] normalized probability heatmaps (for JS loss).
+        """
+        if isinstance(features, (list, tuple)):
+            x = features[-1]
+        else:
+            x = features
+        if self.heatmap_size is not None:
+            x = F.interpolate(x, size=self.heatmap_size, mode='bilinear', align_corners=False)
+        raw = self.conv_block(x)                                          # [B, N, H, W]
+        B, N, H, W = raw.shape
+        heatmaps = F.softmax(raw.reshape(B, N, -1), dim=-1).reshape(B, N, H, W)
+        coords = self.dsnt(heatmaps)
+        return coords, heatmaps
+
+
 class RegressionHead(nn.Module):
     """Custom head for regression tasks (coordinate prediction)."""
     
@@ -544,12 +660,25 @@ def build_task_head(task_config, fpn_out_channels, encoder_channels, model_confi
         # num_classes is actually num_points for regression tasks
         num_points = num_classes
         head_cfg = heads_cfg.get('regression', {})
-        if use_baseline or head_cfg.get('type') == 'baseline':
+        reg_type = head_cfg.get('type', 'default')
+        if use_baseline or reg_type == 'baseline':
             # Use baseline simple regression head
             in_ch = encoder_channels[-1]
             head = BaselineRegressionHead(
                 in_channels=in_ch,
                 num_points=num_points
+            )
+        elif reg_type == 'dsnt':
+            # DSNT: differentiable spatial-to-numerical transform
+            mid_channels = head_cfg.get('mid_channels', 128)
+            heatmap_size = head_cfg.get('heatmap_size', None)
+            if heatmap_size is not None:
+                heatmap_size = tuple(int(s) for s in heatmap_size)
+            head = DSNTRegressionHead(
+                in_channels=fpn_out_channels,
+                num_points=num_points,
+                mid_channels=int(mid_channels),
+                heatmap_size=heatmap_size,
             )
         else:
             # Use advanced regression head with MLP and tanh

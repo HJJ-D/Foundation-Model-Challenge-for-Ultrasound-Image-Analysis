@@ -13,3 +13,8 @@ code.zip
 detection_bbox_verification.png
 code/models/__pycache__/encoders.cpython-312.pyc.1604474761552
 .vscode/settings.json
+UltraTAR-DB9D.zip
+UltraTAR-DB9D/
+code/analysis/
+code/coding_document/
+.claude/settings.local.json

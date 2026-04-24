@@ -8,121 +8,7 @@ import torch.nn.functional as F
 import timm
 import segmentation_models_pytorch as smp
 from .moe import MoEConvBlock
-
-
-# ---------------------------------------------------------------------------
-# LoRA (Low-Rank Adaptation) — manual implementation, no external library
-# ---------------------------------------------------------------------------
-
-class LoRALinear(nn.Module):
-    """Drop-in replacement for nn.Linear with a parallel low-rank branch.
-
-    Forward:  y = W x  +  scaling * B(A(x))
-    Only A and B are trainable; the original weight W stays frozen.
-    B is zero-initialised so the module is an identity at step 0.
-    """
-
-    def __init__(
-        self,
-        linear: nn.Linear,
-        r: int = 16,
-        alpha: float = 32.0,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        if r <= 0:
-            raise ValueError(f"LoRA rank r must be > 0, got {r}")
-
-        in_features = linear.in_features
-        out_features = linear.out_features
-
-        # Freeze original weights
-        self.weight = linear.weight
-        self.weight.requires_grad = False
-        self.bias = linear.bias
-        if self.bias is not None:
-            self.bias.requires_grad = False
-
-        # Low-rank branch: A projects down to r, B projects back up
-        self.lora_A = nn.Linear(in_features, r, bias=False)
-        self.lora_B = nn.Linear(r, out_features, bias=False)
-        self.scaling = alpha / r
-        self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
-
-        # Initialisation: A ~ kaiming, B = 0  →  initial delta = 0
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base = F.linear(x, self.weight, self.bias)
-        delta = self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
-        return base + delta
-
-    def merge_weights(self) -> nn.Linear:
-        """Return a plain nn.Linear with LoRA baked into the weight (for export)."""
-        merged_weight = self.weight.data + (
-            self.lora_B.weight @ self.lora_A.weight
-        ) * self.scaling
-        new_linear = nn.Linear(
-            self.lora_A.in_features,
-            self.lora_B.out_features,
-            bias=self.bias is not None,
-        )
-        new_linear.weight.data.copy_(merged_weight)
-        if self.bias is not None:
-            new_linear.bias.data.copy_(self.bias.data)
-        return new_linear
-
-    def extra_repr(self) -> str:
-        in_f = self.lora_A.in_features
-        out_f = self.lora_B.out_features
-        r = self.lora_A.out_features
-        return f"in={in_f}, out={out_f}, r={r}, scaling={self.scaling:.3f}"
-
-
-def inject_lora(
-    model: nn.Module,
-    target_modules: Sequence[str],
-    r: int = 16,
-    alpha: float = 32.0,
-    dropout: float = 0.0,
-) -> int:
-    """Replace all nn.Linear layers whose *leaf name* is in target_modules with LoRALinear.
-
-    Args:
-        model:          The model to modify in-place.
-        target_modules: Leaf attribute names to replace, e.g. ["qkv", "proj"].
-        r:              LoRA rank.
-        alpha:          LoRA scaling factor (scaling = alpha / r).
-        dropout:        Dropout applied to the input of the low-rank branch.
-
-    Returns:
-        Number of layers replaced.
-    """
-    target_set = set(target_modules)
-    replaced = 0
-
-    # Collect (parent, leaf_name, module) before iterating to avoid mutation issues
-    replacements = []
-    for full_name, module in model.named_modules():
-        if not isinstance(module, nn.Linear):
-            continue
-        leaf_name = full_name.split(".")[-1]
-        if leaf_name not in target_set:
-            continue
-        # Navigate to the parent module
-        parts = full_name.split(".")
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        replacements.append((parent, parts[-1], module))
-
-    for parent, attr, linear in replacements:
-        lora_layer = LoRALinear(linear, r=r, alpha=alpha, dropout=dropout)
-        setattr(parent, attr, lora_layer)
-        replaced += 1
-
-    return replaced
+from .lora import LoraHandle, inject_lora, inject_gated_lora
 
 
 # Swin Transformer model name mapping
@@ -605,6 +491,116 @@ class InteractionBlock(nn.Module):
         return x
 
 
+class InjectorBlock(nn.Module):
+    """Inject CNN spatial detail into ViT tokens via deformable cross-attention.
+
+    ViT spatial tokens are reshaped to a 2D grid and used as Q to attend over CNN
+    features (KV). The result is projected back to ViT dim and added residually,
+    letting ViT attend to fine-grained spatial structure from the CNN pyramid.
+    """
+
+    def __init__(
+        self,
+        vit_dim: int,
+        adapter_channels: int,
+        num_heads: int = 8,
+        num_points: int = 4,
+        offset_range: float = 0.25,
+    ):
+        super().__init__()
+        self.vit_dim = vit_dim
+        self.adapter_channels = adapter_channels
+
+        self.q_norm = nn.LayerNorm(vit_dim)
+        self.q_proj = nn.Linear(vit_dim, adapter_channels, bias=False)
+        self.out_proj = nn.Linear(adapter_channels, vit_dim, bias=False)
+        nn.init.zeros_(self.out_proj.weight)  # zero-init: identity at step 0
+
+        self.cross_attn = DeformableCrossAttention2D(
+            channels=adapter_channels,
+            num_heads=num_heads,
+            num_points=num_points,
+            offset_range=offset_range,
+        )
+        self.cnn_norm = nn.GroupNorm(_gn_groups(adapter_channels), adapter_channels)
+
+    def forward(
+        self,
+        vit_tokens: torch.Tensor,  # [B, prefix+N, vit_dim]
+        cnn_feat: torch.Tensor,    # [B, adapter_channels, H, W]
+        prefix_tokens: int,
+    ) -> torch.Tensor:
+        B, total_len, _ = vit_tokens.shape
+        N = total_len - prefix_tokens
+        H_grid = W_grid = int(math.sqrt(N))
+
+        spatial = vit_tokens[:, prefix_tokens:, :]  # [B, N, vit_dim]
+
+        # Project to adapter space and reshape to 2D query map
+        q = self.q_proj(self.q_norm(spatial))  # [B, N, adapter_channels]
+        q_2d = q.reshape(B, H_grid, W_grid, self.adapter_channels).permute(0, 3, 1, 2)
+
+        # Resize CNN feature to match ViT grid if needed
+        cnn_kv = self.cnn_norm(cnn_feat)
+        if cnn_kv.shape[2:] != q_2d.shape[2:]:
+            cnn_kv = F.interpolate(cnn_kv, size=q_2d.shape[2:], mode='bilinear', align_corners=False)
+
+        # Deformable cross-attention: Q=ViT grid, KV=CNN
+        attn_out = self.cross_attn(q_2d, cnn_kv)  # [B, adapter_channels, H_grid, W_grid]
+
+        # Flatten, project back to vit_dim, residual add to spatial tokens
+        delta = self.out_proj(
+            attn_out.permute(0, 2, 3, 1).reshape(B, N, self.adapter_channels)
+        )  # [B, N, vit_dim]
+
+        return torch.cat([vit_tokens[:, :prefix_tokens, :], spatial + delta], dim=1)
+
+
+class ExtractorBlock(nn.Module):
+    """Extract ViT semantics into CNN feature map via deformable cross-attention.
+
+    ViT spatial tokens are reshaped to a 2D map, projected to cnn_channels, then
+    used as KV by InteractionBlock (CNN as Q). Wraps InteractionBlock with token
+    reshaping and channel projection.
+    """
+
+    def __init__(
+        self,
+        cnn_channels: int,
+        vit_dim: int,
+        num_heads: int = 8,
+        num_points: int = 4,
+        offset_range: float = 0.25,
+    ):
+        super().__init__()
+        self.vit_proj = nn.Conv2d(vit_dim, cnn_channels, kernel_size=1, bias=False)
+        self.interaction = InteractionBlock(
+            channels=cnn_channels,
+            num_heads=num_heads,
+            num_points=num_points,
+            offset_range=offset_range,
+        )
+
+    def forward(
+        self,
+        cnn_feat: torch.Tensor,    # [B, cnn_channels, H, W]
+        vit_tokens: torch.Tensor,  # [B, prefix+N, vit_dim]
+        prefix_tokens: int,
+    ) -> torch.Tensor:
+        B, total_len, vit_dim = vit_tokens.shape
+        N = total_len - prefix_tokens
+        H_vit = W_vit = int(math.sqrt(N))
+
+        spatial = vit_tokens[:, prefix_tokens:, :]  # [B, N, vit_dim]
+        vit_2d = spatial.reshape(B, H_vit, W_vit, vit_dim).permute(0, 3, 1, 2)
+        vit_kv = self.vit_proj(vit_2d)  # [B, cnn_channels, H_vit, W_vit]
+
+        if vit_kv.shape[2:] != cnn_feat.shape[2:]:
+            vit_kv = F.interpolate(vit_kv, size=cnn_feat.shape[2:], mode='bilinear', align_corners=False)
+
+        return self.interaction(cnn_feat, vit_kv)
+
+
 class Dinov3Encoder(nn.Module):
     """DINOv3 encoder wrapper with 4-scale adapter (stride 4/8/16/32)."""
 
@@ -626,9 +622,13 @@ class Dinov3Encoder(nn.Module):
         vit_layer_mapping: Optional[Sequence[int]] = None,
         input_channels: int = 3,
         lora_config: Optional[Dict[str, Any]] = None,
+        task_configs: Optional[Sequence[Dict[str, Any]]] = None,
     ):
         super().__init__()
         self.input_channels = int(input_channels)
+        # Whether this encoder wants task_id to be passed into forward().
+        # Enabled by Gated LoRA below.
+        self.supports_task_id = False
         self._target_stages = 4
         if out_indices is None:
             out_indices = (2, 5, 8, 11)
@@ -663,29 +663,24 @@ class Dinov3Encoder(nn.Module):
                 param.requires_grad = False
             self.model.eval()
 
-        # LoRA: inject low-rank trainable branches into frozen DINOv3 layers
+        # LoRA: inject low-rank trainable branches into frozen DINOv3 layers.
+        # Two modes (both implemented in models/lora.py):
+        #   - Simple (default): runtime_scale fixed at 1.0 → behaves like
+        #     classic fixed-scale LoRA with scaling = alpha / r.
+        #   - Gated (lora_config.gated.enabled): per-(layer, group) runtime
+        #     scales driven by a prompt controller, written before each forward.
+        # Both paths use FusedQKVLoRALinear for qkv (separate Q/K/V B matrices)
+        # and LoRALinear for proj/fc1/fc2.
         self.use_lora = False
+        self.use_gated_lora = False
+        self.lora_handle: Optional[LoraHandle] = None
+        self.lora_controller = None
         if lora_config and lora_config.get("enabled", False):
-            lora_r = int(lora_config.get("r", 16))
-            lora_alpha = float(lora_config.get("alpha", 32.0))
-            lora_dropout = float(lora_config.get("dropout", 0.0))
-            lora_targets = lora_config.get("target_modules", ["qkv", "proj"])
-            n_replaced = inject_lora(
-                self.model,
-                target_modules=lora_targets,
-                r=lora_r,
-                alpha=lora_alpha,
-                dropout=lora_dropout,
-            )
-            self.use_lora = True
-            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            total = sum(p.numel() for p in self.model.parameters())
-            print(
-                f"✓ LoRA injected into DINOv3: {n_replaced} layers replaced "
-                f"(targets={lora_targets}, r={lora_r}, alpha={lora_alpha}) | "
-                f"trainable params: {trainable:,} / {total:,} "
-                f"({100 * trainable / max(total, 1):.2f}%)"
-            )
+            gated_cfg = lora_config.get("gated", {}) or {}
+            if bool(gated_cfg.get("enabled", False)):
+                self._inject_gated_lora_branch(lora_config, gated_cfg, task_configs)
+            else:
+                self._inject_simple_lora_branch(lora_config)
 
         if not hasattr(self.model, "feature_info"):
             raise ValueError(f"DINOv3 features_only model has no feature_info: {model_name}")
@@ -724,6 +719,89 @@ class Dinov3Encoder(nn.Module):
                 "Use 'resize' or 'spm_interaction'."
             )
         self.output_stride = 32
+
+    # ------------------------------------------------------------------
+    # LoRA injection helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _common_lora_kwargs(lora_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Read LoRA hyperparameters shared by simple and gated paths."""
+        return dict(
+            r=int(lora_config.get("r", 16)),
+            alpha=float(lora_config.get("alpha", 32.0)),
+            dropout=float(lora_config.get("dropout", 0.0)),
+            lora_only=bool(lora_config.get("lora_only", True)),
+            target_modules=list(
+                lora_config.get("target_modules", ["qkv", "proj", "fc1", "fc2"])
+            ),
+        )
+
+    def _inject_simple_lora_branch(self, lora_config: Dict[str, Any]) -> None:
+        """Simple path: runtime_scale fixed at 1.0, no controller. qkv uses
+        FusedQKVLoRALinear so Q/K/V get independent B matrices just like the
+        gated path."""
+        kw = self._common_lora_kwargs(lora_config)
+        handle = inject_lora(vit_model=self.model, **kw)
+
+        self.lora_handle = handle
+        self.use_lora = True
+
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.model.parameters())
+        print(
+            f"✓ LoRA injected into DINOv3: {handle.num_replaced()} layers replaced "
+            f"across {len(handle.layer_handles)} blocks "
+            f"(targets={kw['target_modules']}, r={kw['r']}, alpha={kw['alpha']}, "
+            f"scale={kw['alpha'] / kw['r']:.2f}, lora_only={kw['lora_only']}) | "
+            f"trainable params: {trainable:,} / {total:,} "
+            f"({100 * trainable / max(total, 1):.2f}%)"
+        )
+
+    def _inject_gated_lora_branch(
+        self,
+        lora_config: Dict[str, Any],
+        gated_cfg: Dict[str, Any],
+        task_configs: Optional[Sequence[Dict[str, Any]]],
+    ) -> None:
+        """Gated path: simple injection + a prompt-driven runtime-scale
+        controller that is written into every LoRA module before each forward."""
+        if task_configs is None:
+            raise ValueError(
+                "Gated LoRA requires task_configs; pass them through build_encoder."
+            )
+
+        kw = self._common_lora_kwargs(lora_config)
+        prompt_sources = list(gated_cfg.get("prompt_sources", ["task_type", "task_id"]))
+        handle = inject_gated_lora(
+            vit_model=self.model,
+            task_configs=task_configs,
+            **kw,
+            prompt_sources=prompt_sources,
+            embed_dim=int(gated_cfg.get("embed_dim", 64)),
+            hidden_dim=gated_cfg.get("hidden_dim", None),
+            activation=str(gated_cfg.get("activation", "sigmoid")),
+            max_scale=float(gated_cfg.get("max_scale", 0.5)),
+        )
+        # Register the controller as a submodule so its params get optimized.
+        self.lora_controller = handle.controller
+        self.lora_handle = handle
+        self.use_lora = True
+        self.use_gated_lora = True
+        self.supports_task_id = True
+
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        print(
+            f"✓ Gated LoRA injected into DINOv3: {handle.num_replaced()} layers replaced "
+            f"across {len(handle.layer_handles)} blocks "
+            f"(targets={kw['target_modules']}, r={kw['r']}, alpha={kw['alpha']}, "
+            f"lora_only={kw['lora_only']}, prompts={prompt_sources}, "
+            f"activation={gated_cfg.get('activation', 'sigmoid')}, "
+            f"max_scale={gated_cfg.get('max_scale', 0.5)}) | "
+            f"trainable params: {trainable:,} / {total:,} "
+            f"({100 * trainable / max(total, 1):.2f}%)"
+        )
 
     def _normalize_channels(self, channels):
         if not channels:
@@ -777,9 +855,31 @@ class Dinov3Encoder(nn.Module):
             features.append(features[-1])
         return features
 
-    def forward(self, x):
+    def _apply_gated_lora_scales(self, batch_size: int, device: torch.device, task_id: Optional[str]) -> None:
+        """Compute per-(layer, group) runtime scales from the controller and
+        write them into every LoRA module before the DINO forward runs."""
+        if self.lora_controller is None or self.lora_handle is None:
+            return
+        if task_id is None:
+            raise ValueError("Gated LoRA encoder requires a task_id argument in forward().")
+        scales = self.lora_controller(
+            task_id=task_id, batch_size=batch_size, device=device,
+        )
+        self.lora_handle.write_scales(scales)
+        # Keep a reference to the scales tensor so the autograd graph that feeds
+        # the controller is retained through the DINO forward pass.
+        self._last_lora_scales = scales
+
+    def forward(self, x, task_id: Optional[str] = None):
         if self.freeze_dino and self.model.training:
             self.model.eval()
+            if self.use_lora and self.lora_handle is not None:
+                for h in self.lora_handle.layer_handles:
+                    for m in (h.qkv, h.proj, h.fc1, h.fc2):
+                        if m is not None:
+                            m.train()
+        if self.use_gated_lora:
+            self._apply_gated_lora_scales(batch_size=x.shape[0], device=x.device, task_id=task_id)
         raw_features = self._extract_features(x)
         if self.adapter_type == "resize":
             return self.adapter(raw_features, x.shape[-2:])
@@ -811,15 +911,298 @@ class Dinov3Encoder(nn.Module):
         return [self.input_channels] + list(self._out_channels)
 
 
-def build_encoder(config, task_ids=None, input_channels: int = 3):
+class ViTAdapterEncoder(nn.Module):
+    """ViT-Adapter style encoder: ResNet-50 CNN pyramid + DINOv3 ViT with bidirectional
+    interactions between block groups.
+
+    Each block group is followed by:
+      - Extractor: CNN ← ViT semantics (deformable cross-attn, CNN as Q, ViT tokens as KV)
+      - Injector:  ViT tokens ← CNN spatial detail (deformable cross-attn, ViT as Q, CNN as KV)
+
+    The 4 CNN feature scales (updated by Extractors) are the final encoder output,
+    compatible with the existing FPN decoder. LoRA injection into ViT is supported
+    via the same interface as Dinov3Encoder.
+    """
+
+    is_timm_encoder = True
+
+    def __init__(
+        self,
+        model_name: str,
+        pretrained: bool = True,
+        img_size: int = 224,
+        adapter_channels: int = 256,
+        interaction_indexes: Optional[List[List[int]]] = None,
+        resnet_pretrained: bool = True,
+        resnet_freeze_stages: int = 1,
+        num_heads: int = 16,
+        num_points: int = 4,
+        offset_range: float = 0.25,
+        freeze_vit: bool = True,
+        lora_config: Optional[Dict[str, Any]] = None,
+        task_configs: Optional[Sequence[Dict[str, Any]]] = None,
+        input_channels: int = 3,
+    ):
+        super().__init__()
+        self.input_channels = int(input_channels)
+        self.adapter_channels = adapter_channels
+        self.supports_task_id = False
+
+        # Default: ViT-Large (24 blocks) split into 4 groups of 6
+        if interaction_indexes is None:
+            interaction_indexes = [[0, 5], [6, 11], [12, 17], [18, 23]]
+        self.interaction_indexes = interaction_indexes
+        num_groups = len(interaction_indexes)
+
+        # ── ViT backbone (loaded without features_only to access individual blocks) ──
+        self.vit = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            img_size=img_size,
+            in_chans=self.input_channels,
+        )
+        self.vit_dim: int = self.vit.embed_dim
+        self.num_prefix_tokens: int = getattr(self.vit, 'num_prefix_tokens', 1)
+
+        self.freeze_vit = freeze_vit
+        if self.freeze_vit:
+            for param in self.vit.parameters():
+                param.requires_grad = False
+            self.vit.eval()
+
+        # LoRA injection — same interface as Dinov3Encoder
+        self.use_lora = False
+        self.use_gated_lora = False
+        self.lora_handle: Optional[LoraHandle] = None
+        self.lora_controller = None
+        if lora_config and lora_config.get('enabled', False):
+            gated_cfg = lora_config.get('gated', {}) or {}
+            if bool(gated_cfg.get('enabled', False)):
+                self._inject_gated_lora_branch(lora_config, gated_cfg, task_configs)
+            else:
+                self._inject_simple_lora_branch(lora_config)
+
+        # ── ResNet-50 CNN pyramid ──
+        self.resnet = timm.create_model(
+            'resnet50',
+            pretrained=resnet_pretrained,
+            features_only=True,
+            out_indices=(1, 2, 3, 4),  # C2–C5: 256/512/1024/2048 at stride 4/8/16/32
+        )
+        resnet_channels: List[int] = list(self.resnet.feature_info.channels())
+        self._freeze_resnet_stages(resnet_freeze_stages)
+
+        # Project ResNet channels → adapter_channels
+        self.cnn_proj = nn.ModuleList([
+            nn.Conv2d(ch, adapter_channels, kernel_size=1, bias=False)
+            for ch in resnet_channels
+        ])
+
+        # ── Bidirectional interaction blocks (one pair per group) ──
+        self.injectors = nn.ModuleList([
+            InjectorBlock(
+                vit_dim=self.vit_dim,
+                adapter_channels=adapter_channels,
+                num_heads=num_heads,
+                num_points=num_points,
+                offset_range=offset_range,
+            )
+            for _ in range(num_groups)
+        ])
+        self.extractors = nn.ModuleList([
+            ExtractorBlock(
+                cnn_channels=adapter_channels,
+                vit_dim=self.vit_dim,
+                num_heads=num_heads,
+                num_points=num_points,
+                offset_range=offset_range,
+            )
+            for _ in range(num_groups)
+        ])
+
+        self._out_channels = [adapter_channels] * num_groups
+        self.output_stride = 32
+
+    # ── Freeze helpers ──
+
+    def _freeze_resnet_stages(self, num_stages: int) -> None:
+        """Freeze ResNet-50 stem + first num_stages layers (layer1..layerN)."""
+        if num_stages <= 0:
+            return
+        stem_names = {'conv1', 'bn1', 'act1', 'maxpool', 'stem'}
+        layer_names = {f'layer{i}' for i in range(1, num_stages + 1)}
+        freeze_names = stem_names | layer_names
+        for name, module in self.resnet.named_children():
+            if name in freeze_names:
+                module.eval()
+                for param in module.parameters():
+                    param.requires_grad = False
+
+    # ── LoRA helpers (mirrors Dinov3Encoder) ──
+
+    @staticmethod
+    def _common_lora_kwargs(lora_config: Dict[str, Any]) -> Dict[str, Any]:
+        return dict(
+            r=int(lora_config.get('r', 16)),
+            alpha=float(lora_config.get('alpha', 32.0)),
+            dropout=float(lora_config.get('dropout', 0.0)),
+            lora_only=bool(lora_config.get('lora_only', True)),
+            target_modules=list(lora_config.get('target_modules', ['qkv', 'proj', 'fc1', 'fc2'])),
+        )
+
+    def _inject_simple_lora_branch(self, lora_config: Dict[str, Any]) -> None:
+        kw = self._common_lora_kwargs(lora_config)
+        handle = inject_lora(vit_model=self.vit, **kw)
+        self.lora_handle = handle
+        self.use_lora = True
+        trainable = sum(p.numel() for p in self.vit.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.vit.parameters())
+        print(
+            f"✓ LoRA injected into ViT-Adapter: {handle.num_replaced()} layers replaced "
+            f"(r={kw['r']}, alpha={kw['alpha']}, lora_only={kw['lora_only']}) | "
+            f"trainable: {trainable:,}/{total:,} ({100*trainable/max(total,1):.2f}%)"
+        )
+
+    def _inject_gated_lora_branch(
+        self,
+        lora_config: Dict[str, Any],
+        gated_cfg: Dict[str, Any],
+        task_configs: Optional[Sequence[Dict[str, Any]]],
+    ) -> None:
+        if task_configs is None:
+            raise ValueError("Gated LoRA requires task_configs.")
+        kw = self._common_lora_kwargs(lora_config)
+        prompt_sources = list(gated_cfg.get('prompt_sources', ['task_type', 'task_id']))
+        handle = inject_gated_lora(
+            vit_model=self.vit,
+            task_configs=task_configs,
+            **kw,
+            prompt_sources=prompt_sources,
+            embed_dim=int(gated_cfg.get('embed_dim', 64)),
+            hidden_dim=gated_cfg.get('hidden_dim', None),
+            activation=str(gated_cfg.get('activation', 'sigmoid')),
+            max_scale=float(gated_cfg.get('max_scale', 0.5)),
+        )
+        self.lora_controller = handle.controller
+        self.lora_handle = handle
+        self.use_lora = True
+        self.use_gated_lora = True
+        self.supports_task_id = True
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        print(
+            f"✓ Gated LoRA injected into ViT-Adapter: {handle.num_replaced()} layers replaced | "
+            f"trainable: {trainable:,}/{total:,} ({100*trainable/max(total,1):.2f}%)"
+        )
+
+    def _apply_gated_lora_scales(
+        self, batch_size: int, device: torch.device, task_id: Optional[str]
+    ) -> None:
+        if self.lora_controller is None or self.lora_handle is None:
+            return
+        if task_id is None:
+            raise ValueError("Gated LoRA requires task_id in forward().")
+        scales = self.lora_controller(task_id=task_id, batch_size=batch_size, device=device)
+        self.lora_handle.write_scales(scales)
+        self._last_lora_scales = scales
+
+    # ── ViT manual forward helpers ──
+
+    def _vit_prefix_forward(self, x: torch.Tensor):
+        """patch_embed → prepend cls/reg tokens → positional embedding.
+
+        Returns (tokens, rope) where rope may be None for non-EVA ViTs.
+        EVA-ViT's _pos_embed returns (x, rope) for rotary position embeddings;
+        standard ViT returns just x.
+        """
+        x = self.vit.patch_embed(x)
+        rope = None
+        if hasattr(self.vit, '_pos_embed'):
+            result = self.vit._pos_embed(x)
+            if isinstance(result, tuple):
+                x, rope = result
+            else:
+                x = result
+        else:
+            # Fallback for older timm builds
+            B = x.shape[0]
+            prefix = []
+            if hasattr(self.vit, 'cls_token') and self.vit.cls_token is not None:
+                prefix.append(self.vit.cls_token.expand(B, -1, -1))
+            if hasattr(self.vit, 'reg_token') and self.vit.reg_token is not None:
+                prefix.append(self.vit.reg_token.expand(B, -1, -1))
+            if prefix:
+                x = torch.cat(prefix + [x], dim=1)
+            if hasattr(self.vit, 'pos_embed') and self.vit.pos_embed is not None:
+                x = x + self.vit.pos_embed
+            if hasattr(self.vit, 'pos_drop'):
+                x = self.vit.pos_drop(x)
+        if hasattr(self.vit, 'patch_drop') and self.vit.patch_drop is not None:
+            x = self.vit.patch_drop(x)
+        if hasattr(self.vit, 'norm_pre') and self.vit.norm_pre is not None:
+            x = self.vit.norm_pre(x)
+        return x, rope
+
+    # ── Main forward ──
+
+    def forward(self, x: torch.Tensor, task_id: Optional[str] = None) -> List[torch.Tensor]:
+        if self.freeze_vit and self.vit.training:
+            self.vit.eval()
+            if self.use_lora and self.lora_handle is not None:
+                for h in self.lora_handle.layer_handles:
+                    for m in (h.qkv, h.proj, h.fc1, h.fc2):
+                        if m is not None:
+                            m.train()
+        if self.use_gated_lora:
+            self._apply_gated_lora_scales(x.shape[0], x.device, task_id)
+
+        # CNN pyramid: 4 scales at stride 4/8/16/32, projected to adapter_channels
+        cnn_scales = [proj(feat) for proj, feat in zip(self.cnn_proj, self.resnet(x))]
+
+        # ViT: patch embed + prefix tokens + positional encoding
+        # rope is None for standard ViT; EVA-ViT returns rotary position embeddings
+        vit_tokens, rope = self._vit_prefix_forward(x)
+
+        # Run block groups with bidirectional Extractor→Injector between each group
+        for group_idx, (start, end) in enumerate(self.interaction_indexes):
+            for block_idx in range(start, end + 1):
+                out = self.vit.blocks[block_idx](vit_tokens, rope=rope) if rope is not None else self.vit.blocks[block_idx](vit_tokens)
+                vit_tokens = out[0] if isinstance(out, tuple) else out
+
+            # Extractor: CNN ← ViT semantics (updates cnn_scales in-place for this group)
+            cnn_scales[group_idx] = self.extractors[group_idx](
+                cnn_scales[group_idx], vit_tokens, self.num_prefix_tokens
+            )
+            # Injector: ViT tokens ← CNN spatial detail (CNN now enriched by Extractor)
+            vit_tokens = self.injectors[group_idx](
+                vit_tokens, cnn_scales[group_idx], self.num_prefix_tokens
+            )
+
+        return cnn_scales
+
+    def get_moe_aux_loss(self) -> torch.Tensor:
+        device = next(self.parameters()).device
+        return torch.tensor(0.0, device=device)
+
+    def get_moe_stats(self) -> List:
+        return []
+
+    @property
+    def out_channels(self) -> List[int]:
+        return [self.input_channels] + list(self._out_channels)
+
+
+def build_encoder(config, task_ids=None, input_channels: int = 3, task_configs=None):
     """
     Build encoder from configuration.
-    
+
     Args:
         config: Configuration object
-        task_ids: Optional list of task IDs for MoE
-        input_channels: Number of input channels for encoder stem
-    
+        task_ids: Optional list of task IDs (used by MoE task embedding).
+        input_channels: Number of input channels for encoder stem.
+        task_configs: Optional list of full task config dicts (task_id, task_name,
+            num_classes, …). Required for Gated LoRA prompt vocabularies.
+
     Returns:
         encoder: PyTorch encoder module
     """
@@ -870,35 +1253,63 @@ def build_encoder(config, task_ids=None, input_channels: int = 3):
             'channels',
             config.get('model.encoder.adapter_channels', 256)
         ))
-        spm_stem_channels = int(adapter_cfg.get('spm_stem_channels', 64))
-        interaction_heads = int(adapter_cfg.get('interaction_heads', 8))
-        interaction_points = int(adapter_cfg.get('interaction_points', 4))
-        interaction_offset_range = float(adapter_cfg.get('interaction_offset_range', 0.25))
-        vit_layer_mapping = adapter_cfg.get('vit_layer_mapping', None)
         freeze_dino = config.get('model.encoder.freeze_dino', True)
         lora_config = config.get('model.encoder.lora', None)
-        encoder = Dinov3Encoder(
-            model_name=timm_name,
-            pretrained=pretrained,
-            img_size=img_size,
-            out_indices=out_indices,
-            adapter_channels=adapter_channels,
-            adapter_type=adapter_type,
-            spm_stem_channels=spm_stem_channels,
-            interaction_heads=interaction_heads,
-            interaction_points=interaction_points,
-            interaction_offset_range=interaction_offset_range,
-            freeze_dino=freeze_dino,
-            vit_layer_mapping=vit_layer_mapping,
-            input_channels=input_channels,
-            lora_config=lora_config,
-        )
-        mapping_info = f", vit_layer_mapping={vit_layer_mapping}" if vit_layer_mapping else ""
-        print(
-            f"Loaded DINOv3 encoder: {timm_name} "
-            f"(img_size={img_size}, adapter_type={adapter_type}, "
-            f"adapter_channels={adapter_channels}, freeze_dino={freeze_dino}{mapping_info})"
-        )
+
+        if adapter_type == 'vit_adapter':
+            interaction_indexes = adapter_cfg.get(
+                'interaction_indexes', [[0, 5], [6, 11], [12, 17], [18, 23]]
+            )
+            encoder = ViTAdapterEncoder(
+                model_name=timm_name,
+                pretrained=pretrained,
+                img_size=img_size,
+                adapter_channels=adapter_channels,
+                interaction_indexes=interaction_indexes,
+                resnet_pretrained=bool(adapter_cfg.get('pyramid_pretrained', True)),
+                resnet_freeze_stages=int(adapter_cfg.get('pyramid_freeze_stages', 1)),
+                num_heads=int(adapter_cfg.get('interaction_heads', 16)),
+                num_points=int(adapter_cfg.get('interaction_points', 4)),
+                offset_range=float(adapter_cfg.get('interaction_offset_range', 0.25)),
+                freeze_vit=freeze_dino,
+                lora_config=lora_config,
+                task_configs=task_configs,
+                input_channels=input_channels,
+            )
+            print(
+                f"Loaded ViT-Adapter encoder: {timm_name} "
+                f"(img_size={img_size}, adapter_channels={adapter_channels}, "
+                f"groups={interaction_indexes}, freeze_vit={freeze_dino})"
+            )
+        else:
+            spm_stem_channels = int(adapter_cfg.get('spm_stem_channels', 64))
+            interaction_heads = int(adapter_cfg.get('interaction_heads', 8))
+            interaction_points = int(adapter_cfg.get('interaction_points', 4))
+            interaction_offset_range = float(adapter_cfg.get('interaction_offset_range', 0.25))
+            vit_layer_mapping = adapter_cfg.get('vit_layer_mapping', None)
+            encoder = Dinov3Encoder(
+                model_name=timm_name,
+                pretrained=pretrained,
+                img_size=img_size,
+                out_indices=out_indices,
+                adapter_channels=adapter_channels,
+                adapter_type=adapter_type,
+                spm_stem_channels=spm_stem_channels,
+                interaction_heads=interaction_heads,
+                interaction_points=interaction_points,
+                interaction_offset_range=interaction_offset_range,
+                freeze_dino=freeze_dino,
+                vit_layer_mapping=vit_layer_mapping,
+                input_channels=input_channels,
+                lora_config=lora_config,
+                task_configs=task_configs,
+            )
+            mapping_info = f", vit_layer_mapping={vit_layer_mapping}" if vit_layer_mapping else ""
+            print(
+                f"Loaded DINOv3 encoder: {timm_name} "
+                f"(img_size={img_size}, adapter_type={adapter_type}, "
+                f"adapter_channels={adapter_channels}, freeze_dino={freeze_dino}{mapping_info})"
+            )
     
     else:
         timm_name = encoder_name

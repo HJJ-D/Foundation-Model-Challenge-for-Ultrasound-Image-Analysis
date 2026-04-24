@@ -70,7 +70,12 @@ class MultiTaskModel(nn.Module):
         
         # Build encoder
         task_ids = [cfg['task_id'] for cfg in self.task_configs]
-        self.encoder = build_encoder(config, task_ids=task_ids, input_channels=self.encoder_input_channels)
+        self.encoder = build_encoder(
+            config,
+            task_ids=task_ids,
+            input_channels=self.encoder_input_channels,
+            task_configs=self.task_configs,
+        )
         
         # Normalize encoder channel metadata to [in, c1, c2, ...]
         raw_channels = list(self.encoder.out_channels)
@@ -411,14 +416,31 @@ class MultiTaskModel(nn.Module):
     
     def get_trainable_parameters(self):
         """
-        Get trainable parameters grouped by encoder and heads.
-        
+        Get trainable parameters grouped by encoder, LoRA, and heads.
+
+        Any encoder parameter whose qualified name contains ``lora_`` is routed
+        into the LoRA group. This covers:
+            - ``lora_A`` / ``lora_B`` / ``lora_B_{q,k,v}``   — low-rank branches
+            - ``lora_prompt_embeddings.*``                    — prompt embeddings
+            - ``lora_ctrl_heads.*``                           — gating MLPs
+        The LoRA group typically receives a higher learning rate than the
+        frozen-backbone adapters (SPM, interaction blocks, vit_proj).
+
         Returns:
-            encoder_params: List of encoder parameters
-            head_params: List of head parameters (including decoders)
+            encoder_params: Non-LoRA trainable encoder parameters (adapter, SPM, …)
+            head_params:    Decoder + head + conditioning parameters
+            lora_params:    LoRA + gating-controller parameters
         """
-        encoder_params = list(self.encoder.parameters())
-        
+        encoder_params = []
+        lora_params = []
+        for name, param in self.encoder.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'lora_' in name:
+                lora_params.append(param)
+            else:
+                encoder_params.append(param)
+
         head_params = []
         head_params += list(self.fpn_decoder_seg.parameters())
         if self.fpn_decoder_det is not self.fpn_decoder_seg:
@@ -440,8 +462,8 @@ class MultiTaskModel(nn.Module):
         if self.use_prompt_fpn and self.prompt_fpn_condition_encoder is not None:
             if self.prompt_fpn_condition_encoder is not self.task_condition_encoder:
                 head_params += list(self.prompt_fpn_condition_encoder.parameters())
-        
-        return encoder_params, head_params
+
+        return encoder_params, head_params, lora_params
 
     def get_moe_aux_loss(self):
         device = next(self.parameters()).device

@@ -1,7 +1,7 @@
 experiment:
-  name: swin_b_heads_prompt_fpn_task_type_plus_semantic
+  name: Dino_lora_gated
   seed: 42
-  output_dir: outputs/new/prompt_fpn
+  output_dir: outputs/new/Dinov3_lora
   save_checkpoints: false
   checkpoint_freq: 10
 
@@ -12,6 +12,11 @@ data:
   num_workers: 4
   pin_memory: true
   image_size: 256
+  task_type_sampling_weights:
+    segmentation: 0.33
+    classification: 0.34
+    detection: 0.17
+    Regression: 0.16
   augmentation:
     train:
       random_brightness_contrast: 0.2
@@ -55,23 +60,53 @@ model:
     name: dinov3
     pretrained: imagenet
     timm_name: vit_large_patch16_dinov3.lvd1689m
-    out_indices: [2, 9, 16, 23]
+    out_indices: [2, 9, 16, 23]   # 仅用于 spm_interaction/resize，vit_adapter 忽略此字段
     freeze_dino: true
     adapter:
-      type: spm_interaction      # CNN pyramid + deformable cross-attn，比 resize 空间质量更好
-      channels: 256              # 输出通道数
-      spm_stem_channels: 64      # SPM stem 通道数
-      interaction_heads: 8       # cross-attn head 数
-      interaction_points: 4      # 每个 head 的 deformable 采样点数
+      # type 可选：
+      #   vit_adapter     — ViT-Adapter 风格（ResNet-50 CNN pyramid + ViT 组间双向交互）[当前]
+      #   spm_interaction — 轻量 SPM CNN pyramid + 单次晚期融合（原始方案）
+      #   resize          — 纯 resize adapter，无 CNN 分支
+      type: vit_adapter
+      channels: 256              # 输出通道数 / adapter_channels
+
+      # ── vit_adapter 专属参数 ──
+      # ViT-Large 24 层分 4 组，每组 6 层；组间各做一次 Extractor + Injector
+      interaction_indexes: [[0,5],[6,11],[12,17],[18,23]]
+      pyramid_pretrained: true   # ResNet-50 使用 ImageNet 预训练权重
+      pyramid_freeze_stages: 1   # 冻结 stem + layer1；layer2-4 随训练微调
+      interaction_heads: 16      # deformable cross-attn head 数（256 / 16 = 16 per head）
+      interaction_points: 4      # 每 head 的 deformable 采样点数
       interaction_offset_range: 0.25
-      # ViT 各尺度对应的层索引（对应 out_indices 的位置）
-      # stride4(细节) → layer0(out_idx=2), stride8 → layer1(10), stride16 → layer2(16), stride32(语义) → layer3(23)
+
+      # ── spm_interaction 专属参数（type=spm_interaction 时生效）──
+      spm_stem_channels: 64
       vit_layer_mapping: [0, 1, 2, 3]
     lora:
       enabled: true
-      r: 16
-      alpha: 32.0
-      target_modules: ["qkv", "proj"]
+      r: 16           # ViT-Large d_model=1024
+      alpha: 32.0     # scaling = alpha/r = 2.0
+      lora_only: true                                # 冻结 base，只训 LoRA (+ controller, if gated)
+      target_modules: ["qkv", "proj", "fc1", "fc2"]  # 覆盖 Attn + MLP，simple / gated 都生效
+      # 注：qkv 始终使用 FusedQKVLoRALinear —— 共享 A + 3 个独立 B，
+      # 对应 q/k/v 三个独立输出。simple 分支 runtime_scale 固定 1.0，
+      # gated 分支由 controller 动态写入每层每组的 scale。
+
+      # ----- Gated LoRA（Prompt-Gated Runtime-Scaled LoRA）-----
+      # 启用后在 simple 注入之上额外构造 prompt-driven controller，动态门控
+      # 每层每组的贡献强度；target_modules / lora_only 沿用外层字段。
+      gated:
+        enabled: false
+        # 可选的 prompt 源（参考 task_condition.py 的元数据字段）
+        #   task_type, task_id, organ, is_pathology, is_fetal, num_classes
+        prompt_sources: ["task_type", "task_id"]
+        embed_dim: 64                     # prompt embedding 维度
+        hidden_dim: null                  # ctrl 头隐藏层（null = embed_dim）
+        activation: sigmoid               # sigmoid | softplus | tanh01
+        max_scale: 0.5                    # clamp 上界，防 LoRA 压过 base
+        # 注：最终 LoRA 贡献 = (alpha/r) * runtime_scale * B(A(x))
+        # 推荐搭配 r=8, alpha=16（base_scale=2.0），与 max_scale=0.5 叠加后
+        # 实际有效幅度 ≤ 1.0。
 
   decoder:
     type: fpn
@@ -111,8 +146,8 @@ model:
     # apply_stages: [1, 2, 3, 4]  # optional, supports 1-based or 0-based indexing
 
   prompt_fpn:
-    enabled: true
-    decoder_backend: "prompt_fpn"  # "base_fpn" | "prompt_fpn"
+    enabled: false
+    decoder_backend: "base_fpn"  # "base_fpn" | "prompt_fpn"
     condition_source: "task_type_plus_semantic"  # "task_type_only" | "task_type_plus_organ" | "task_type_plus_semantic" | "full_semantic"
     condition_dim: 128
     hidden_dim: 128
@@ -146,17 +181,17 @@ model:
       num_anchors: 1
 
     regression:
-      type: default
-      hidden_dims: [256, 128]
-      use_tanh: true
-      mid_channels: 256
-      dropout: 0.3
+      type: "dsnt"      # Differentiable Spatial to Numerical Transform head
+      mid_channels: 128         # intermediate conv channels for DSNT conv block
+      heatmap_size: [32, 32]   # null → FPN size (64×64); [32,32] recommended (softmax 更集中)
+      sigma: 0.07              # Gaussian sigma in [-1,1] space; rule of thumb ~2/H (~1 grid cell)
+      reg_weight: 0.5          # weight of JS divergence regularization loss
 
 training:
   num_epochs: 100
 
   single_task:
-    enabled: false
+    enabled: true
     task_id: ""
     task_name: Detection
 
@@ -165,8 +200,9 @@ training:
     learning_rate: 0.0001
     weight_decay: 0.0001
     use_grouped_lr: true
-    encoder_lr_multiplier: 0.1
+    encoder_lr_multiplier: 0.2   # SPM / interaction adapter
     head_lr_multiplier: 1.0
+    lora_lr_multiplier: 1.0      # LoRA 从零训练，用 base lr
 
   scheduler:
     type: CosineAnnealingLR
@@ -205,7 +241,7 @@ training:
     regression:
       type: MSELoss
 
-  gradient_clip: 1.0
+  gradient_clip: 5.0
   accumulation_steps: 1
   print_freq: 100
   log_metrics: true

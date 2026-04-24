@@ -21,7 +21,7 @@ class MultiTaskDataset(Dataset):
         if not os.path.isdir(self.csv_path):
             raise FileNotFoundError(f"CSV path not found: {self.csv_path}")
             
-        all_csv_files = sorted(glob.glob(os.path.join(self.csv_path, '*.csv')))
+        all_csv_files = glob.glob(os.path.join(self.csv_path, '*.csv'))
         if not all_csv_files:
             raise FileNotFoundError(f"No CSV files found in {self.csv_path}")
             
@@ -51,13 +51,15 @@ class MultiTaskDataset(Dataset):
             print(f"Warning: Failed to load image: {image_abs_path}")
             return self.__getitem__((idx + 1) % len(self))
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Save original image size BEFORE any transforms (for Regression coordinate normalization)
+        original_height, original_width = image.shape[:2]
 
         # Load raw labels based on task
         label = None
         mask = None
         bboxes = []
         class_labels = []
-        keypoints = []  # for Regression: list of (x, y) tuples passed to albumentations
 
         if task_name == 'segmentation':
             if pd.notna(record.get('mask_path')):
@@ -67,7 +69,7 @@ class MultiTaskDataset(Dataset):
                     mask = cv2.imdecode(mask_stream, cv2.IMREAD_GRAYSCALE)
                 except:
                     mask = None
-
+        
         elif task_name == 'classification':
             label = int(record['mask'])
 
@@ -80,9 +82,7 @@ class MultiTaskDataset(Dataset):
                     coords.extend(json.loads(record[col]))
                 else:
                     coords.extend([0, 0])
-            # Register as albumentations keypoints so geometric transforms apply correctly
-            keypoints = [(coords[i], coords[i + 1]) for i in range(0, len(coords), 2)]
-            label = np.array(coords, dtype=np.float32)  # fallback when transforms=None
+            label = np.array(coords, dtype=np.float32)
 
         elif task_name == 'detection':
             cols = ['x_min', 'y_min', 'x_max', 'y_max']
@@ -93,9 +93,9 @@ class MultiTaskDataset(Dataset):
 
         # Apply augmentations
         if self.transforms:
-            augmented = self.transforms(image=image, mask=mask, bboxes=bboxes, class_labels=class_labels, keypoints=keypoints)
+            augmented = self.transforms(image=image, mask=mask, bboxes=bboxes, class_labels=class_labels)
             image = augmented['image']
-
+            
             if task_name == 'segmentation':
                 label = augmented.get('mask')
             elif task_name == 'detection':
@@ -103,12 +103,6 @@ class MultiTaskDataset(Dataset):
                     label = np.array(augmented['bboxes'][0][:4], dtype=np.float32)
                 else:
                     label = np.array([-1.0, -1.0, -1.0, -1.0], dtype=np.float32)
-            elif task_name == 'Regression':
-                aug_kps = augmented['keypoints']
-                flat = []
-                for kp in aug_kps:
-                    flat.extend([kp[0], kp[1]])
-                label = np.array(flat, dtype=np.float32)
 
         # Format conversion & normalization
         final_label = None
@@ -135,8 +129,8 @@ class MultiTaskDataset(Dataset):
                 label[[0, 2]] /= w
                 label[[1, 3]] /= h
             elif task_name == 'Regression':
-                label[0::2] /= w
-                label[1::2] /= h
+                label[0::2] /= original_width
+                label[1::2] /= original_height
             
             final_label = torch.from_numpy(label).float()
         
@@ -144,14 +138,7 @@ class MultiTaskDataset(Dataset):
 
 
 class MultiTaskUniformSampler(Sampler[List[int]]):
-    def __init__(self, dataset: MultiTaskDataset, batch_size: int, steps_per_epoch: Optional[int] = None,
-                 seed: Optional[int] = None, type_weights: Optional[dict] = None):
-        """
-        Args:
-            type_weights: dict mapping task_type name -> sampling weight. If None, uniform sampling.
-                          Values are automatically normalized to sum to 1.
-                          Example: {'segmentation': 0.33, 'classification': 0.34, 'detection': 0.17, 'Regression': 0.16}
-        """
+    def __init__(self, dataset: MultiTaskDataset, batch_size: int, steps_per_epoch: Optional[int] = None, seed: Optional[int] = None):
         self.dataset = dataset
         self.batch_size = batch_size
         self.indices_by_task = {}
@@ -163,49 +150,16 @@ class MultiTaskUniformSampler(Sampler[List[int]]):
             if task_id not in self.indices_by_task:
                 self.indices_by_task[task_id] = []
             self.indices_by_task[task_id].append(idx)
-
+            
         self.task_ids = list(self.indices_by_task.keys())
-
+        
         # Initial shuffle
         for task_id in self.task_ids:
             self.rng.shuffle(self.indices_by_task[task_id])
 
-        # Build task_type -> [task_ids] mapping
-        task_id_to_type = (
-            dataset.dataframe[['task_id', 'task_name']]
-            .drop_duplicates('task_id')
-            .set_index('task_id')['task_name']
-            .to_dict()
-        )
-        self.tasks_by_type = {}
-        for task_id in self.task_ids:
-            task_type = task_id_to_type[task_id]
-            if task_type not in self.tasks_by_type:
-                self.tasks_by_type[task_type] = []
-            self.tasks_by_type[task_type].append(task_id)
-        self.task_types = list(self.tasks_by_type.keys())
-
-        # Build normalized task-type sampling weights
-        if type_weights is not None:
-            raw = [float(type_weights.get(t, 1.0)) for t in self.task_types]
-        else:
-            raw = [1.0] * len(self.task_types)
-        total_w = sum(raw)
-        self.type_sampling_weights = [w / total_w for w in raw]
-
-        print("Task-type sampling distribution:")
-        for t, w in zip(self.task_types, self.type_sampling_weights):
-            n_task_ids = len(self.tasks_by_type[t])
-            n_samples = sum(len(self.indices_by_task[tid]) for tid in self.tasks_by_type[t])
-            print(f"  {t}: weight={w:.3f} ({w*100:.1f}%) | {n_task_ids} sub-tasks | {n_samples} samples")
-
         # Determine epoch length
         if steps_per_epoch is None:
-            self.steps_per_epoch = len(self.task_types) * max(
-                len(ids) for ids in self.tasks_by_type.values()
-            ) * (max(len(self.indices_by_task[tid]) for tid in self.task_ids) // self.batch_size)
-            # Fallback to simple heuristic if above is unreasonably large
-            self.steps_per_epoch = min(self.steps_per_epoch, len(self.dataset) // self.batch_size)
+            self.steps_per_epoch = len(self.dataset) // self.batch_size
         else:
             self.steps_per_epoch = steps_per_epoch
 
@@ -213,9 +167,8 @@ class MultiTaskUniformSampler(Sampler[List[int]]):
         task_cursors = {task_id: 0 for task_id in self.task_ids}
 
         for _ in range(self.steps_per_epoch):
-            # Two-level weighted sampling: pick task type by weight, then task_id uniformly within type
-            task_type = self.rng.choices(self.task_types, weights=self.type_sampling_weights)[0]
-            task_id = self.rng.choice(self.tasks_by_type[task_type])
+            # Randomly select a task
+            task_id = self.rng.choice(self.task_ids)
             indices = self.indices_by_task[task_id]
             cursor = task_cursors[task_id]
             

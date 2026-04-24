@@ -14,6 +14,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from collections import defaultdict
 from tqdm import tqdm
+import random
 import numpy as np
 import pandas as pd
 
@@ -41,8 +42,9 @@ def build_dataloaders(config):
             std=config.get('data.augmentation.normalize.std')
         ),
         ToTensorV2(),
-    ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['class_labels'], clip=True, min_visibility=0.1))
-    
+    ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['class_labels'], clip=True, min_visibility=0.1),
+       keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+
     # Validation transforms
     val_transforms = A.Compose([
         A.Resize(config.image_size, config.image_size),
@@ -51,7 +53,8 @@ def build_dataloaders(config):
             std=config.get('data.augmentation.normalize.std')
         ),
         ToTensorV2(),
-    ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['class_labels'], clip=True, min_visibility=0.1))
+    ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['class_labels'], clip=True, min_visibility=0.1),
+       keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
     
     # Create full dataset first
     full_dataset = MultiTaskDataset(data_root=config.data_root, transforms=None)
@@ -144,13 +147,22 @@ def build_dataloaders(config):
     val_dataset.dataframe = full_dataset.dataframe.iloc[val_indices].reset_index(drop=True)
     
     # Create samplers
+    type_weights = config.get('data.task_type_sampling_weights', None)
     train_sampler = MultiTaskUniformSampler(
         dataset=train_dataset,
         batch_size=config.batch_size,
         steps_per_epoch=config.get('training.steps_per_epoch'),
-        seed=config.seed
+        seed=config.seed,
+        type_weights=type_weights
     )
     
+    # Worker init function: seed each worker independently for reproducible augmentation
+    seed = config.seed
+    def worker_init_fn(worker_id):
+        worker_seed = seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+
     # Create dataloaders
     # Note: MultiTaskUniformSampler returns batches, so use as batch_sampler
     train_loader = DataLoader(
@@ -158,16 +170,18 @@ def build_dataloaders(config):
         batch_sampler=train_sampler,
         num_workers=config.num_workers,
         pin_memory=config.get('data.pin_memory', True),
-        collate_fn=multi_task_collate_fn
+        collate_fn=multi_task_collate_fn,
+        worker_init_fn=worker_init_fn
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
         pin_memory=config.get('data.pin_memory', True),
-        collate_fn=multi_task_collate_fn
+        collate_fn=multi_task_collate_fn,
+        worker_init_fn=worker_init_fn
     )
     
     return train_loader, val_loader
@@ -180,15 +194,24 @@ def build_optimizer(model, config, loss_weighter=None):
     weight_decay = float(config.weight_decay)
     
     if use_grouped_lr:
-        encoder_params, head_params = model.get_trainable_parameters()
+        encoder_params, head_params, lora_params = model.get_trainable_parameters()
         encoder_lr_mult = float(config.get('training.optimizer.encoder_lr_multiplier', 0.1))
         head_lr_mult = float(config.get('training.optimizer.head_lr_multiplier', 1.0))
-        
+        lora_lr_mult = float(config.get('training.optimizer.lora_lr_multiplier', 1.0))
+
         param_groups = [
             {'params': encoder_params, 'lr': lr * encoder_lr_mult},
-            {'params': head_params, 'lr': lr * head_lr_mult}
+            {'params': head_params, 'lr': lr * head_lr_mult},
         ]
-        print(f"✓ Using grouped LR: encoder={lr * encoder_lr_mult:.2e}, heads={lr * head_lr_mult:.2e}")
+        if lora_params:
+            param_groups.append({'params': lora_params, 'lr': lr * lora_lr_mult})
+            print(
+                f"✓ Using grouped LR: encoder={lr * encoder_lr_mult:.2e}, "
+                f"heads={lr * head_lr_mult:.2e}, "
+                f"lora={lr * lora_lr_mult:.2e} ({len(lora_params)} param tensors)"
+            )
+        else:
+            print(f"✓ Using grouped LR: encoder={lr * encoder_lr_mult:.2e}, heads={lr * head_lr_mult:.2e}")
     else:
         param_groups = model.parameters()
     
@@ -256,8 +279,13 @@ def build_scheduler(optimizer, config):
 def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, device, config, current_epoch=0):
     """Train for one epoch."""
     model.train()
-    if hasattr(model, 'set_current_epoch'):
-        model.set_current_epoch(current_epoch)
+    epoch_target = model
+    if not hasattr(epoch_target, 'set_current_epoch') and hasattr(epoch_target, 'module'):
+        epoch_target = epoch_target.module
+    if not hasattr(epoch_target, 'set_current_epoch') and hasattr(epoch_target, '_orig_mod'):
+        epoch_target = epoch_target._orig_mod
+    if hasattr(epoch_target, 'set_current_epoch'):
+        epoch_target.set_current_epoch(current_epoch)
     epoch_losses = defaultdict(list)
     epoch_task_weights = defaultdict(list)  # Track adaptive weights
     moe_task_stats = {}
@@ -267,6 +295,9 @@ def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, de
     use_deep_supervision = config.get('model.heads.segmentation.use_deep_supervision', False)
     aux_loss_weights = [float(w) for w in config.get('model.heads.segmentation.aux_loss_weights', [0.5, 0.3, 0.2])]
     moe_balance_weight = float(config.get('model.moe.balance_loss_weight', 0.0))
+    use_dsnt = config.get('model.heads.regression.type', 'default') == 'dsnt'
+    dsnt_sigma = float(config.get('model.heads.regression.sigma', 1.5))
+    dsnt_reg_weight = float(config.get('model.heads.regression.reg_weight', 1.0))
     
     # Check if using adaptive loss
     from losses.loss_functions import AdaptiveLossWeighter
@@ -419,14 +450,31 @@ def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, de
                 
                 loss = loss_functions[task_name](final_outputs, targets)
         
+        elif task_name == 'Regression' and use_dsnt and isinstance(outputs, tuple):
+            from models.heads import DSNTRegressionHead
+            coords, heatmaps = outputs
+            coord_loss = loss_functions[task_name](coords, labels.float())
+            B_h, N_h, H_h, W_h = heatmaps.shape
+            target_heatmaps = DSNTRegressionHead.make_gaussian_heatmaps(
+                labels.float(), H_h, W_h, sigma=dsnt_sigma
+            )
+            reg_loss = DSNTRegressionHead.js_divergence(heatmaps, target_heatmaps)
+            loss = coord_loss + dsnt_reg_weight * reg_loss
+
         else:
             loss = loss_functions[task_name](outputs, labels)
-        
+
         # Apply task weight (adaptive or fixed)
         if use_adaptive_loss:
-            # Use adaptive weighting
-            losses_dict = {task_name: loss}
-            total_loss, weighted_losses, task_weights = loss_weights(losses_dict)
+            # During warmup, detach loss from sigma graph so sigma gets no gradient
+            if freeze_adaptive:
+                losses_dict = {task_name: loss.detach()}
+            else:
+                losses_dict = {task_name: loss}
+            total_loss, _, task_weights = loss_weights(losses_dict)
+            # During warmup total_loss has no grad_fn for sigma, so we need the raw loss for backward
+            if freeze_adaptive:
+                total_loss = loss * task_weights[task_name]  # use current (frozen) weight as scalar
             epoch_task_weights[task_name].append(task_weights[task_name])
         else:
             # Use fixed weight
@@ -437,22 +485,15 @@ def train_epoch(model, train_loader, loss_functions, loss_weights, optimizer, de
         if moe_balance_weight > 0 and hasattr(model, "get_moe_aux_loss"):
             moe_aux_loss = model.get_moe_aux_loss()
             total_loss = total_loss + moe_balance_weight * moe_aux_loss
-        
+
         # Backward pass
         optimizer.zero_grad()
         total_loss.backward()
-        
+
         # Gradient clipping
         gradient_clip = float(config.get('training.gradient_clip', 0))
         if gradient_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-        
-        # During warmup, don't update adaptive loss parameters
-        if use_adaptive_loss and freeze_adaptive:
-            # Zero out gradients for adaptive loss parameters
-            for param in loss_weights.parameters():
-                if param.grad is not None:
-                    param.grad.zero_()
         
         optimizer.step()
         
@@ -619,7 +660,7 @@ def main(config_path=None):
         #   segmentation   : Dice
         #   detection      : IoU
         #   Regression     : (upper_bound - MAE) / (upper_bound - lower_bound), clipped to [0, 1]
-        MAE_UPPER_BOUND = 100.0  # pixels — adjust if typical MAE range differs
+        MAE_UPPER_BOUND = 100.0  # pixels — worst expected MAE / STD
         MAE_LOWER_BOUND = 0.0
         task_scores = []
         if not val_results_df.empty:
@@ -642,6 +683,7 @@ def main(config_path=None):
                 elif task_name == 'Regression':
                     mae = row.get('MAE (pixels)', np.nan)
                     if pd.notna(mae):
+                        # Score based on MAE only; MAE_std is reported separately as a diagnostic metric
                         normalized = (MAE_UPPER_BOUND - mae) / (MAE_UPPER_BOUND - MAE_LOWER_BOUND)
                         task_scores.append(float(np.clip(normalized, 0.0, 1.0)))
         avg_val_score = float(np.mean(task_scores)) if task_scores else 0.0
@@ -668,7 +710,10 @@ def main(config_path=None):
                 if 'IoU' in row and pd.notna(row['IoU']):
                     metrics_str_parts.append(f"IoU={row['IoU']:.4f}")
                 if 'MAE (pixels)' in row and pd.notna(row['MAE (pixels)']):
-                    metrics_str_parts.append(f"MAE={row['MAE (pixels)']:.4f}")
+                    mae_str = f"MAE={row['MAE (pixels)']:.4f}"
+                    if 'MAE_std (pixels)' in row and pd.notna(row['MAE_std (pixels)']):
+                        mae_str += f"±{row['MAE_std (pixels)']:.4f}"
+                    metrics_str_parts.append(mae_str)
                 metrics_str = ", ".join(metrics_str_parts) if metrics_str_parts else "N/A"
                 print(f"  {task_id:<30}: {metrics_str}")
         
@@ -754,7 +799,7 @@ def main(config_path=None):
            "classification": ["Accuracy", "F1-Score"],  # Include both Accuracy and F1-Score for classification
            "segmentation": ["Dice"],
            "detection": ["IoU"],
-           "regression": ["MAE (pixels)"]
+           "regression": ["MAE (pixels)", "MAE_std (pixels)"]
         }
 
         for group_name, metrics in task_groups.items():
@@ -777,8 +822,14 @@ def main(config_path=None):
                    "Accuracy": group_means.get("Accuracy"),
                    "F1-Score": group_means.get("F1-Score")
                }
+           elif group_name == "regression":
+               # Store both MAE and STD for regression
+               best_model_eval_on_train[group_name] = {
+                   "MAE (pixels)": group_means.get("MAE (pixels)"),
+                   "MAE_std (pixels)": group_means.get("MAE_std (pixels)")
+               }
            else:
-               # For other groups, store the first available metric
+               # For segmentation and detection, store the first available metric
                best_model_eval_on_train[group_name] = next((v for v in group_means.values() if v is not None), None)
 
     # Save best model summary at the end of training
