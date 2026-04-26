@@ -8,6 +8,13 @@ import torch.nn.functional as F
 from segmentation_models_pytorch.decoders.fpn.decoder import FPNDecoder
 
 
+def _gn_groups(channels: int) -> int:
+    groups = min(32, channels)
+    while channels % groups != 0:
+        groups -= 1
+    return groups
+
+
 class PromptAttentionBlock(nn.Module):
     """Pre-norm cross-attention + FFN block with gated residual update."""
 
@@ -248,56 +255,143 @@ class PromptFPNDecoder(nn.Module):
         return self.dropout(fused)
 
 
+class ResidualConvUnit(nn.Module):
+    """Pre-norm residual conv block used in DPT fusion."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        gn = _gn_groups(channels)
+        self.block = nn.Sequential(
+            nn.GroupNorm(gn, channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.GroupNorm(gn, channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.block(x)
+
+
+class DPTFusionBlock(nn.Module):
+    """One DPT fusion stage: optional skip-add, two RCUs, optional 2× upsample."""
+
+    def __init__(self, channels: int, upsample: bool = True):
+        super().__init__()
+        self.rcu = nn.Sequential(ResidualConvUnit(channels), ResidualConvUnit(channels))
+        self.upsample = upsample
+
+    def forward(self, x: torch.Tensor, skip: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if skip is not None:
+            x = x + skip
+        x = self.rcu(x)
+        if self.upsample:
+            x = F.interpolate(x, scale_factor=2.0, mode='bilinear', align_corners=False)
+        return x
+
+
+class DPTDecoder(nn.Module):
+    """DPT-style decoder for 4-scale encoder features.
+
+    Fuses the 4 feature maps (stride 4/8/16/32) produced by any encoder via
+    progressive top-down merging with residual conv units. Outputs
+    [B, out_channels, H/4, W/4] — identical shape to the FPN decoder output,
+    so all existing task heads work without modification.
+    """
+
+    def __init__(
+        self,
+        encoder_channels: Sequence[int],
+        feature_channels: int = 256,
+        out_channels: int = 128,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        # encoder_channels: [input_ch, c1, c2, c3, c4 (,c5…)] — same as FPN convention
+        stage_channels = list(encoder_channels[1:])
+        if len(stage_channels) > 4:
+            stage_channels = stage_channels[-4:]  # keep deepest 4 stages
+        assert len(stage_channels) == 4, (
+            f"DPTDecoder needs exactly 4 encoder stages, got {len(stage_channels)}"
+        )
+
+        self._out_channels = int(out_channels)
+        fc = int(feature_channels)
+
+        # Project each stage to a common feature_channels width
+        self.laterals = nn.ModuleList([
+            nn.Conv2d(ch, fc, kernel_size=1, bias=False) for ch in stage_channels
+        ])
+
+        # 4 fusion blocks processed deepest→shallowest:
+        #   fusion[0]: stride-32 → stride-16  (upsample)
+        #   fusion[1]: stride-16 → stride-8   (upsample)
+        #   fusion[2]: stride-8  → stride-4   (upsample)
+        #   fusion[3]: stride-4  → stride-4   (no upsample, final)
+        self.fusion = nn.ModuleList([
+            DPTFusionBlock(fc, upsample=True),
+            DPTFusionBlock(fc, upsample=True),
+            DPTFusionBlock(fc, upsample=True),
+            DPTFusionBlock(fc, upsample=False),
+        ])
+
+        self.head = nn.Sequential(
+            nn.Conv2d(fc, self._out_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_gn_groups(self._out_channels), self._out_channels),
+            nn.SiLU(inplace=True),
+        )
+        self.dropout = nn.Dropout2d(float(dropout)) if float(dropout) > 0 else nn.Identity()
+
+    @property
+    def out_channels(self) -> int:
+        return self._out_channels
+
+    def forward(self, features: Sequence[torch.Tensor], cond_vec=None) -> torch.Tensor:
+        feats = list(features)
+        if len(feats) > 4:
+            feats = feats[-4:]  # SMP encoders may include extra leading levels
+        # feats[0]=stride-4 (finest), feats[3]=stride-32 (coarsest)
+        laterals = [proj(f) for proj, f in zip(self.laterals, feats)]
+
+        x = self.fusion[0](laterals[3])                 # H/32 → H/16
+        x = self.fusion[1](x, skip=laterals[2])         # H/16 → H/8
+        x = self.fusion[2](x, skip=laterals[1])         # H/8  → H/4
+        x = self.fusion[3](x, skip=laterals[0])         # H/4  (no upsample)
+
+        return self.dropout(self.head(x))
+
+
+def _get_encoder_channels(encoder) -> List[int]:
+    """Return encoder channel list in [input_ch, stage1_ch, …] format."""
+    encoder_input_channels = int(getattr(encoder, "input_channels", 3))
+    if hasattr(encoder, 'is_timm_encoder') and encoder.is_timm_encoder:
+        return list(encoder.out_channels)
+    return [encoder_input_channels] + list(encoder.out_channels)
+
+
+_SUFFIX_MAP = {'seg': 'segmentation', 'det': 'detection', 'cls': 'classification', 'reg': 'regression'}
+
+
 def build_fpn_decoder(encoder, config, decoder_type='seg'):
-    """
-    Build FPN decoder from configuration.
-    
-    Args:
-        encoder: Encoder module
-        config: Configuration object
-        decoder_type: 'seg' for segmentation or 'det' for detection
-    
-    Returns:
-        decoder: FPN decoder module
-    """
-    # Get FPN configuration
+    """Build FPN decoder from configuration."""
     pyramid_channels = int(config.get('model.decoder.pyramid_channels', 256))
     segmentation_channels = int(config.get('model.decoder.segmentation_channels', 128))
     dropout = float(config.get('model.decoder.dropout', 0.2))
     merge_policy = config.get('model.decoder.merge_policy', 'cat')
-    
-    # Get encoder output channels in FPN format: [input_channels, stage1, stage2, ...]
-    # Custom wrapper encoders (Swin/ViT/DINOv3) already include input channel in out_channels
-    # SMP encoders (ResNet/EfficientNet) don't include it, need to prepend input channels.
-    encoder_input_channels = int(getattr(encoder, "input_channels", 3))
-    if hasattr(encoder, 'is_timm_encoder') and encoder.is_timm_encoder:
-        encoder_channels = encoder.out_channels
-    else:
-        # SMP encoders: [c1, c2, c3, c4, c5] -> [input_channels, c1, c2, c3, c4, c5]
-        encoder_channels = [encoder_input_channels] + list(encoder.out_channels)
-    
-    # encoder_depth is the number of feature stages (excluding input)
+
+    encoder_channels = _get_encoder_channels(encoder)
     encoder_depth = len(encoder_channels) - 1
-    
-    # Create FPN decoder with encoder channel information
+
     decoder = FPNDecoder(
         encoder_channels=encoder_channels,
         encoder_depth=encoder_depth,
         pyramid_channels=pyramid_channels,
         segmentation_channels=segmentation_channels,
         dropout=dropout,
-        merge_policy=merge_policy
+        merge_policy=merge_policy,
     )
-    
-    suffix_map = {
-        'seg': 'segmentation',
-        'det': 'detection',
-        'cls': 'classification',
-        'reg': 'regression',
-    }
-    suffix = suffix_map.get(decoder_type, decoder_type)
-    print(f"Built FPN decoder for {suffix}")
-    
+    print(f"Built FPN decoder for {_SUFFIX_MAP.get(decoder_type, decoder_type)}")
     return decoder
 
 
@@ -311,11 +405,7 @@ def build_prompt_fpn_decoder(encoder, config, decoder_type='seg'):
     dropout = float(decoder_cfg.get('dropout', 0.2))
     merge_policy = decoder_cfg.get('merge_policy', 'cat')
 
-    encoder_input_channels = int(getattr(encoder, "input_channels", 3))
-    if hasattr(encoder, 'is_timm_encoder') and encoder.is_timm_encoder:
-        encoder_channels = encoder.out_channels
-    else:
-        encoder_channels = [encoder_input_channels] + list(encoder.out_channels)
+    encoder_channels = _get_encoder_channels(encoder)
     encoder_depth = len(encoder_channels) - 1
 
     decoder = PromptFPNDecoder(
@@ -335,60 +425,65 @@ def build_prompt_fpn_decoder(encoder, config, decoder_type='seg'):
         apply_stages=prompt_cfg.get('apply_stages', None),
         init_scale=float(prompt_cfg.get('init_scale', 0.02)),
     )
-
-    suffix_map = {
-        'seg': 'segmentation',
-        'det': 'detection',
-        'cls': 'classification',
-        'reg': 'regression',
-    }
-    suffix = suffix_map.get(decoder_type, decoder_type)
-    print(f"Built PromptFPN decoder for {suffix}")
+    print(f"Built PromptFPN decoder for {_SUFFIX_MAP.get(decoder_type, decoder_type)}")
     print(f"PromptFPN apply stages: {decoder.apply_stage_indices}")
     return decoder
 
 
+def build_dpt_decoder(encoder, config, decoder_type='seg'):
+    """Build DPT decoder from configuration."""
+    decoder_cfg = config.get('model.decoder', {}) or {}
+    dpt_cfg = (decoder_cfg.get('dpt') or {}) if isinstance(decoder_cfg, dict) else {}
+
+    feature_channels = int(dpt_cfg.get('feature_channels', decoder_cfg.get('pyramid_channels', 256)))
+    out_channels = int(dpt_cfg.get('out_channels', decoder_cfg.get('segmentation_channels', 128)))
+    dropout = float(decoder_cfg.get('dropout', 0.2))
+
+    encoder_channels = _get_encoder_channels(encoder)
+
+    decoder = DPTDecoder(
+        encoder_channels=encoder_channels,
+        feature_channels=feature_channels,
+        out_channels=out_channels,
+        dropout=dropout,
+    )
+    print(f"Built DPT decoder for {_SUFFIX_MAP.get(decoder_type, decoder_type)}")
+    return decoder
+
+
 def build_decoders(encoder, config):
-    """
-    Build all required decoders.
-    
-    Args:
-        encoder: Encoder module
-        config: Configuration object
-    
-    Returns:
-        decoders: Dictionary of decoder modules
-    """
+    """Build all required decoders."""
     decoders = {}
-    
-    prompt_cfg = config.get('model.prompt_fpn', {}) or {}
-    prompt_enabled = bool(prompt_cfg.get('enabled', False))
-    decoder_backend = str(prompt_cfg.get('decoder_backend', 'base_fpn')).lower()
-    use_prompt_decoder = prompt_enabled and decoder_backend == 'prompt_fpn'
 
-    build_decoder_fn = build_prompt_fpn_decoder if use_prompt_decoder else build_fpn_decoder
-    backend_name = 'PromptFPN' if use_prompt_decoder else 'FPN'
+    decoder_type_name = str(config.get('model.decoder.type', 'fpn')).lower()
 
-    # Segmentation decoder
+    if decoder_type_name == 'dpt':
+        build_decoder_fn = build_dpt_decoder
+        backend_name = 'DPT'
+    else:
+        prompt_cfg = config.get('model.prompt_fpn', {}) or {}
+        prompt_enabled = bool(prompt_cfg.get('enabled', False))
+        decoder_backend = str(prompt_cfg.get('decoder_backend', 'base_fpn')).lower()
+        use_prompt_decoder = prompt_enabled and decoder_backend == 'prompt_fpn'
+        build_decoder_fn = build_prompt_fpn_decoder if use_prompt_decoder else build_fpn_decoder
+        backend_name = 'PromptFPN' if use_prompt_decoder else 'FPN'
+
     decoders['fpn_seg'] = build_decoder_fn(encoder, config, decoder_type='seg')
-    
-    # Detection FPN decoder (separate or shared)
+
     if config.get('model.decoder.separate_detection_fpn', True):
         decoders['fpn_det'] = build_decoder_fn(encoder, config, decoder_type='det')
         print(f"Using separate {backend_name} decoder for detection")
     else:
-        decoders['fpn_det'] = decoders['fpn_seg']  # Share with segmentation
+        decoders['fpn_det'] = decoders['fpn_seg']
         print(f"Sharing {backend_name} decoder between segmentation and detection")
 
-    # Classification FPN decoder (separate or shared)
     if config.get('model.decoder.separate_classification_fpn', True):
         decoders['fpn_cls'] = build_decoder_fn(encoder, config, decoder_type='cls')
         print(f"Using separate {backend_name} decoder for classification")
     else:
-        decoders['fpn_cls'] = decoders['fpn_seg']  # Share with segmentation
+        decoders['fpn_cls'] = decoders['fpn_seg']
         print(f"Sharing {backend_name} decoder between segmentation and classification")
 
-    # Regression FPN decoder (separate or shared)
     if config.get('model.decoder.separate_regression_fpn', True):
         decoders['fpn_reg'] = build_decoder_fn(encoder, config, decoder_type='reg')
         print(f"Using separate {backend_name} decoder for regression")

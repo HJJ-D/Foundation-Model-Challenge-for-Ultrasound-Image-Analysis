@@ -109,16 +109,23 @@ model:
         # 实际有效幅度 ≤ 1.0。
 
   decoder:
-    type: fpn
+    type: dpt          # fpn | dpt
     pyramid_channels: 256
     segmentation_channels: 128
     dropout: 0.2
-    merge_policy: cat
+    merge_policy: cat  # fpn/prompt_fpn only
     separate_detection_fpn: true
     separate_classification_fpn: true
     separate_regression_fpn: true
     use_fpn_for_classification: true
     use_fpn_for_regression: true
+
+    # ── DPT-specific (only used when type: dpt) ──────────────────────
+    # feature_channels: internal DPT channel width (defaults to pyramid_channels)
+    # out_channels:     final output channels     (defaults to segmentation_channels)
+    dpt:
+      feature_channels: 256
+      out_channels: 128
 
   use_film: false
   film:
