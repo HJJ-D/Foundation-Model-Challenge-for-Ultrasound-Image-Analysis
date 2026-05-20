@@ -1,0 +1,256 @@
+# ViT-Large (ImageNet supervised) + Freeze + LoRA + ViT-Adapter
+# Ablation: same adaptation pipeline as DINOv3, but with ImageNet ViT backbone
+# Purpose: isolate the contribution of DINOv3 self-supervised pretraining
+
+experiment:
+  name: ViT_freeze_lora_adapter
+  seed: 42
+  output_dir: outputs/ablation/vit_freeze_lora_adapter
+  save_checkpoints: false
+  checkpoint_freq: 10
+
+data:
+  root_path: "/proj/berzbiomedicalimagingkth/users/x_hujun/Foundation-Model-Challenge-for-Ultrasound-Image-Analysis/dataset/"
+  val_split: 0.2
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  image_size: 256
+  task_type_sampling_weights:
+    segmentation: 0.33
+    classification: 0.34
+    detection: 0.17
+    Regression: 0.16
+  augmentation:
+    train:
+      random_brightness_contrast: 0.2
+      gauss_noise: 0.1
+      horizontal_flip: 0.0
+      vertical_flip: 0.0
+    normalize:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+
+model:
+  moe:
+    enabled: false
+
+  encoder:
+    name: vit_l
+    pretrained: imagenet
+    timm_name: vit_large_patch16_224
+    out_indices: [5, 11, 17, 23]
+    freeze_encoder: true             # Freeze ViT backbone, same as DINOv3 setting
+    adapter:
+      type: vit_adapter
+      channels: 256
+      interaction_indexes: [[0,5],[6,11],[12,17],[18,23]]  # ViT-Large 24 blocks, 4 groups
+      pyramid_pretrained: true
+      pyramid_freeze_stages: 1
+      interaction_heads: 16
+      interaction_points: 4
+      interaction_offset_range: 0.25
+    lora:
+      enabled: true
+      r: 16
+      alpha: 32.0
+      lora_only: true
+      target_modules: ["qkv", "proj", "fc1", "fc2"]
+      gated:
+        enabled: false
+
+  decoder:
+    type: dpt
+    pyramid_channels: 256
+    segmentation_channels: 128
+    dropout: 0.2
+    merge_policy: cat
+    separate_detection_fpn: true
+    separate_classification_fpn: true
+    separate_regression_fpn: true
+    use_fpn_for_classification: true
+    use_fpn_for_regression: true
+    dpt:
+      feature_channels: 256
+      out_channels: 128
+
+  use_film: false
+  film:
+    use_task_embedding: false
+    embedding_dim: 64
+    use_affine: true
+
+  task_prompt:
+    enabled: false
+  feature_prompt:
+    enabled: false
+  prompt_fpn:
+    enabled: false
+
+  heads:
+    segmentation:
+      type: default
+      upsampling: 4
+      mid_channels: 128
+      num_blocks: 2
+      use_deep_supervision: false
+      num_aux_outputs: 3
+      aux_loss_weights: [0.5, 0.3, 0.2]
+    classification:
+      type: default
+      mid_channels: 256
+      dropout: 0.3
+    detection:
+      type: centernet
+      mid_channels: 128
+      num_anchors: 1
+    regression:
+      type: "dsnt"
+      mid_channels: 128
+      heatmap_size: [32, 32]
+      sigma: 0.07
+      reg_weight: 0.5
+
+training:
+  num_epochs: 100
+  single_task:
+    enabled: false
+    task_id: ""
+    task_name: ""
+  optimizer:
+    type: AdamW
+    learning_rate: 0.0001
+    weight_decay: 0.0001
+    use_grouped_lr: true
+    encoder_lr_multiplier: 0.2
+    head_lr_multiplier: 1.0
+    lora_lr_multiplier: 1.0
+  scheduler:
+    type: CosineAnnealingLR
+    T_max: 100
+    eta_min: 1e-6
+  loss_weights:
+    segmentation: 1.0
+    classification: 1.0
+    detection: 1.0
+    regression: 1.0
+  adaptive_loss:
+    enabled: false
+    init_log_vars: -1.0
+    learning_rate: 0.0001
+    warmup_epochs: 3
+  loss_configs:
+    segmentation:
+      type: DiceLoss
+      mode: multiclass
+    classification:
+      type: CrossEntropyLoss
+    detection:
+      type: Centernet
+      heatmap_alpha: 2.0
+      heatmap_gamma: 4.0
+      size_weight: 1.0
+      offset_weight: 1.0
+      classification_weight: 2.0
+      box_regression_weight: 1.0
+    regression:
+      type: MSELoss
+  gradient_clip: 5.0
+  accumulation_steps: 1
+  print_freq: 100
+  log_metrics: true
+
+validation:
+  enabled: true
+  freq: 1
+  save_best_model: true
+  metric_for_best: mean_score
+
+device:
+  use_cuda: true
+  multi_gpu: false
+  device_ids: [0]
+  mixed_precision: false
+
+tasks:
+  - task_id: FUGC
+    task_name: Regression
+    num_classes: 2
+  - task_id: IUGC
+    task_name: Regression
+    num_classes: 3
+  - task_id: fetal_femur
+    task_name: Regression
+    num_classes: 2
+  - task_id: breast_2cls
+    task_name: classification
+    num_classes: 2
+  - task_id: breast_3cls
+    task_name: classification
+    num_classes: 3
+  - task_id: fetal_head_pos_cls
+    task_name: classification
+    num_classes: 8
+  - task_id: fetal_plane_cls
+    task_name: classification
+    num_classes: 6
+  - task_id: fetal_sacral_pos_cls
+    task_name: classification
+    num_classes: 8
+  - task_id: liver_lesion_2cls
+    task_name: classification
+    num_classes: 2
+  - task_id: lung_2cls
+    task_name: classification
+    num_classes: 2
+  - task_id: lung_disease_3cls
+    task_name: classification
+    num_classes: 3
+  - task_id: organ_cls
+    task_name: classification
+    num_classes: 6
+  - task_id: spinal_cord_injury_loc
+    task_name: detection
+    num_classes: 1
+  - task_id: thyroid_nodule_det
+    task_name: detection
+    num_classes: 1
+  - task_id: uterine_fibroid_det
+    task_name: detection
+    num_classes: 1
+  - task_id: breast_lesion
+    task_name: segmentation
+    num_classes: 2
+  - task_id: cardiac_multi
+    task_name: segmentation
+    num_classes: 4
+  - task_id: carotid_artery
+    task_name: segmentation
+    num_classes: 2
+  - task_id: cervix
+    task_name: segmentation
+    num_classes: 2
+  - task_id: cervix_multi
+    task_name: segmentation
+    num_classes: 3
+  - task_id: fetal_abdomen_multi
+    task_name: segmentation
+    num_classes: 5
+  - task_id: fetal_head
+    task_name: segmentation
+    num_classes: 2
+  - task_id: fetal_heart
+    task_name: segmentation
+    num_classes: 2
+  - task_id: head_symphysis_multi
+    task_name: segmentation
+    num_classes: 3
+  - task_id: lung
+    task_name: segmentation
+    num_classes: 2
+  - task_id: ovary_tumor
+    task_name: segmentation
+    num_classes: 2
+  - task_id: thyroid_nodule
+    task_name: segmentation
+    num_classes: 2

@@ -1225,24 +1225,89 @@ def build_encoder(config, task_ids=None, input_channels: int = 3, task_configs=N
         print(f"Loaded Swin Transformer: {encoder_name} (img_size={img_size})")
     
     elif encoder_name.startswith('vit_'):
-        # Use TimmEncoder for ViT models with adapter for multi-scale features
         pretrained = (encoder_weights == 'imagenet' or encoder_weights is not None)
-        adapter_channels = config.get('model.encoder.adapter_channels', None)
-        if adapter_channels is not None:
-            adapter_channels = int(adapter_channels)
-        
-        encoder = TimmEncoder(
-            model_name=encoder_name,
-            pretrained=pretrained,
-            img_size=img_size,
-            out_indices=out_indices,
-            adapter_channels=adapter_channels,
-            use_adapter=True,
-            input_channels=input_channels,
-        )
-        full_name = VIT_MODEL_MAPPING.get(encoder_name, encoder_name)
-        adapter_info = f" with adapter (channels={adapter_channels})" if adapter_channels else ""
-        print(f"Loaded ViT encoder: {encoder_name} -> {full_name} (img_size={img_size}){adapter_info}")
+        timm_name = config.get('model.encoder.timm_name', None) or VIT_MODEL_MAPPING.get(encoder_name, encoder_name)
+        adapter_cfg = config.get('model.encoder.adapter', {}) or {}
+        adapter_type = adapter_cfg.get('type', None)
+        freeze_encoder = config.get('model.encoder.freeze_encoder', False)
+        lora_config = config.get('model.encoder.lora', None)
+
+        # Advanced path: freeze/LoRA/ViT-Adapter — reuse the same classes as DINOv3
+        if adapter_type == 'vit_adapter':
+            adapter_channels = int(adapter_cfg.get('channels', 256))
+            interaction_indexes = adapter_cfg.get(
+                'interaction_indexes', [[0, 2], [3, 5], [6, 8], [9, 11]]
+            )
+            encoder = ViTAdapterEncoder(
+                model_name=timm_name,
+                pretrained=pretrained,
+                img_size=img_size,
+                adapter_channels=adapter_channels,
+                interaction_indexes=interaction_indexes,
+                resnet_pretrained=bool(adapter_cfg.get('pyramid_pretrained', True)),
+                resnet_freeze_stages=int(adapter_cfg.get('pyramid_freeze_stages', 1)),
+                num_heads=int(adapter_cfg.get('interaction_heads', 16)),
+                num_points=int(adapter_cfg.get('interaction_points', 4)),
+                offset_range=float(adapter_cfg.get('interaction_offset_range', 0.25)),
+                freeze_vit=freeze_encoder,
+                lora_config=lora_config,
+                task_configs=task_configs,
+                input_channels=input_channels,
+            )
+            print(
+                f"Loaded ViT + ViT-Adapter encoder: {timm_name} "
+                f"(img_size={img_size}, adapter_channels={adapter_channels}, "
+                f"groups={interaction_indexes}, freeze={freeze_encoder})"
+            )
+        elif freeze_encoder or (lora_config and lora_config.get('enabled', False)):
+            # Freeze + LoRA with resize/spm adapter (same as Dinov3Encoder but
+            # backed by an ImageNet-supervised ViT instead of DINOv3)
+            adapter_channels = int(adapter_cfg.get(
+                'channels', config.get('model.encoder.adapter_channels', 256)
+            ))
+            spm_stem_channels = int(adapter_cfg.get('spm_stem_channels', 64))
+            vit_layer_mapping = adapter_cfg.get('vit_layer_mapping', None)
+            a_type = adapter_cfg.get('type', 'resize') or 'resize'
+            encoder = Dinov3Encoder(
+                model_name=timm_name,
+                pretrained=pretrained,
+                img_size=img_size,
+                out_indices=out_indices,
+                adapter_channels=adapter_channels,
+                adapter_type=a_type,
+                spm_stem_channels=spm_stem_channels,
+                interaction_heads=int(adapter_cfg.get('interaction_heads', 8)),
+                interaction_points=int(adapter_cfg.get('interaction_points', 4)),
+                interaction_offset_range=float(adapter_cfg.get('interaction_offset_range', 0.25)),
+                freeze_dino=freeze_encoder,
+                vit_layer_mapping=vit_layer_mapping,
+                input_channels=input_channels,
+                lora_config=lora_config,
+                task_configs=task_configs,
+            )
+            print(
+                f"Loaded ViT encoder (freeze+adapt): {timm_name} "
+                f"(img_size={img_size}, adapter={a_type}, channels={adapter_channels}, "
+                f"freeze={freeze_encoder})"
+            )
+        else:
+            # Simple path: full finetune with FourScaleAdapter (original behavior)
+            adapter_channels = config.get('model.encoder.adapter_channels', None)
+            if adapter_channels is not None:
+                adapter_channels = int(adapter_channels)
+
+            encoder = TimmEncoder(
+                model_name=encoder_name,
+                pretrained=pretrained,
+                img_size=img_size,
+                out_indices=out_indices,
+                adapter_channels=adapter_channels,
+                use_adapter=True,
+                input_channels=input_channels,
+            )
+            full_name = VIT_MODEL_MAPPING.get(encoder_name, encoder_name)
+            adapter_info = f" with adapter (channels={adapter_channels})" if adapter_channels else ""
+            print(f"Loaded ViT encoder: {encoder_name} -> {full_name} (img_size={img_size}){adapter_info}")
     
     elif encoder_name.startswith('dinov3') or (encoder_name.startswith('timm:') and 'dinov3' in encoder_name):
         pretrained = (encoder_weights == 'imagenet' or encoder_weights is not None)

@@ -20,6 +20,8 @@ import os
 import sys
 import json
 import random
+import glob
+import math
 
 import cv2
 import numpy as np
@@ -465,9 +467,406 @@ def visualize_task(model, dataset, task_id, task_configs, device, norm_mean, nor
     print(f"  Score range: [{min(scores):.4f}, {max(scores):.4f}], mean={np.mean(scores):.4f}")
 
 
+def visualize_dataset_overview(data_root: str, save_dir: str):
+    """
+    Generate one composite figure per task type with GT annotations.
+    All task_ids included, at most 3 per row. No model needed.
+    Saves: overview_segmentation.png, overview_classification.png, etc.
+    """
+    csv_path = os.path.join(data_root, 'csv_files')
+    all_csv_files = glob.glob(os.path.join(csv_path, '*.csv'))
+    if not all_csv_files:
+        print(f"ERROR: No CSV files found in {csv_path}")
+        return
+
+    df = pd.concat([pd.read_csv(f) for f in all_csv_files], ignore_index=True)
+
+    task_configs = {}
+    for _, row in df.iterrows():
+        tid = row['task_id']
+        if tid not in task_configs:
+            task_configs[tid] = {
+                'task_type': row['task_name'].lower(),
+                'num_classes': int(row['num_classes']),
+            }
+
+    type_to_ids = defaultdict(list)
+    for tid, cfg in task_configs.items():
+        type_to_ids[cfg['task_type']].append(tid)
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    type_display = [
+        ('segmentation',   'Segmentation'),
+        ('classification', 'Classification'),
+        ('detection',      'Detection'),
+        ('regression',     'Regression'),
+    ]
+
+    for type_key, display_name in type_display:
+        if type_key not in type_to_ids:
+            continue
+
+        task_ids = sorted(type_to_ids[type_key])
+        n = len(task_ids)
+        cols = min(3, n)
+        rows = math.ceil(n / cols)
+
+        fig, axes = plt.subplots(rows, cols, squeeze=False,
+                                 figsize=(cols * 4.5, rows * 4.5 + 0.8))
+        fig.suptitle(display_name, fontsize=22, fontweight='bold', y=1.01)
+
+        for i, task_id in enumerate(task_ids):
+            ax = axes[i // cols][i % cols]
+            task_data = df[df['task_id'] == task_id]
+            if len(task_data) == 0:
+                ax.axis('off')
+                continue
+
+            sample = task_data.sample(1, random_state=42).iloc[0]
+            img_path = os.path.normpath(os.path.join(csv_path, sample['image_path']))
+            image = cv2.imread(img_path)
+            if image is None:
+                ax.text(0.5, 0.5, 'Image not found', ha='center', va='center',
+                        transform=ax.transAxes, fontsize=13)
+                ax.axis('off')
+                continue
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            orig_h, orig_w = image.shape[:2]
+            cell_px = 256
+            scale_x = cell_px / orig_w
+            scale_y = cell_px / orig_h
+            image = cv2.resize(image, (cell_px, cell_px), interpolation=cv2.INTER_LINEAR)
+
+            ax.imshow(image)
+            num_classes = task_configs[task_id]['num_classes']
+
+            if type_key == 'segmentation':
+                if pd.notna(sample.get('mask_path')):
+                    mask_path = os.path.normpath(os.path.join(csv_path, sample['mask_path']))
+                    gt_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                    if gt_mask is not None:
+                        gt_mask = cv2.resize(gt_mask, (cell_px, cell_px),
+                                             interpolation=cv2.INTER_NEAREST)
+                        overlay = np.ma.masked_where(gt_mask == 0, gt_mask)
+                        ax.imshow(overlay, alpha=0.55, cmap='jet',
+                                  vmin=0, vmax=max(num_classes - 1, 1))
+
+            elif type_key == 'classification':
+                if pd.notna(sample.get('mask')):
+                    ax.text(0.04, 0.96, f'Class: {int(sample["mask"])}',
+                            transform=ax.transAxes, fontsize=13, color='white',
+                            fontweight='bold', va='top',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='navy', alpha=0.8))
+
+            elif type_key == 'detection':
+                bbox_cols = ['x_min', 'y_min', 'x_max', 'y_max']
+                if all(c in sample.index and pd.notna(sample[c]) for c in bbox_cols):
+                    x0, y0, x1, y1 = [float(sample[c]) for c in bbox_cols]
+                    x0, x1 = x0 * scale_x, x1 * scale_x
+                    y0, y1 = y0 * scale_y, y1 * scale_y
+                    ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0,
+                                           linewidth=3, edgecolor='lime', facecolor='none'))
+
+            elif type_key == 'regression':
+                gt_points = []
+                for pi in range(1, num_classes + 1):
+                    col = f'point_{pi}_xy'
+                    if col in sample.index and pd.notna(sample[col]):
+                        try:
+                            gt_points.extend(json.loads(sample[col]))
+                        except Exception:
+                            gt_points.extend([0, 0])
+                    else:
+                        gt_points.extend([0, 0])
+                if gt_points:
+                    pts = np.array(gt_points, dtype=float).reshape(-1, 2)
+                    pts[:, 0] *= scale_x
+                    pts[:, 1] *= scale_y
+                    ax.scatter(pts[:, 0], pts[:, 1], c='lime', s=100,
+                               marker='o', edgecolors='white', linewidths=2, zorder=5)
+                    for j, (x, y) in enumerate(pts):
+                        ax.text(x, y - 8, str(j + 1), color='white', fontsize=11,
+                                ha='center', fontweight='bold',
+                                bbox=dict(boxstyle='round,pad=0.2', facecolor='green', alpha=0.8))
+
+            ax.set_title(task_id.replace('_', ' '), fontsize=13, fontweight='bold', pad=4)
+            ax.axis('off')
+
+        for i in range(n, rows * cols):
+            axes[i // cols][i % cols].axis('off')
+
+        plt.tight_layout()
+        save_path = os.path.join(save_dir, f'overview_{type_key}.png')
+        plt.savefig(save_path, dpi=200, bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
+        plt.close()
+        print(f"Saved: {save_path}")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Model comparison on identical samples
+# ──────────────────────────────────────────────────────────────────────
+
+def find_model_checkpoint(model_dir):
+    """Return path to a model checkpoint in model_dir, or None."""
+    for name in ['best_model.pth', 'best_model.pt', 'model.pth', 'model.pt']:
+        p = os.path.join(model_dir, name)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def pick_fixed_sample_per_task(val_dataset, seed):
+    """Deterministically pick exactly one dataset-position per task_id.
+
+    Sorting by (task_id, image_path) + a local RandomState guarantees the
+    selection is identical across independent runs regardless of global RNG.
+    Returns: dict {task_id: dataset_position}.
+    """
+    df = val_dataset.dataframe.copy().reset_index(drop=True)
+    df['_pos'] = np.arange(len(df))
+    df_sorted = df.sort_values(['task_id', 'image_path']).reset_index(drop=True)
+    rng = np.random.RandomState(seed)
+    picks = {}
+    for tid in sorted(df_sorted['task_id'].unique()):
+        group = df_sorted[df_sorted['task_id'] == tid]
+        choice = int(rng.randint(0, len(group)))
+        picks[tid] = int(group.iloc[choice]['_pos'])
+    return picks
+
+
+def load_trained_model(model_dir, data_root, task_configs, device):
+    """Load a trained model from its directory using its own config, but force
+    the task_configs to match a shared reference set so head shapes align."""
+    config_path = os.path.join(model_dir, 'config.yaml')
+    if not os.path.isfile(config_path):
+        print(f"  [SKIP] config.yaml not found in {model_dir}")
+        return None
+    ckpt_path = find_model_checkpoint(model_dir)
+    if ckpt_path is None:
+        print(f"  [SKIP] no checkpoint found in {model_dir}")
+        return None
+
+    cfg = load_config(config_path)
+    cfg.config['data']['root_path'] = data_root
+    cfg.data_root = data_root
+    cfg.config.setdefault('training', {}).setdefault('single_task', {})['enabled'] = False
+    cfg.set_task_configs_from_dataset(task_configs)
+
+    model = build_model(cfg).to(device)
+    state = torch.load(ckpt_path, map_location=device)
+    if isinstance(state, dict) and 'model_state_dict' in state:
+        state = state['model_state_dict']
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"  [WARN] {len(missing)} missing keys when loading {ckpt_path}")
+    if unexpected:
+        print(f"  [WARN] {len(unexpected)} unexpected keys when loading {ckpt_path}")
+    model.eval()
+    print(f"  Loaded checkpoint: {ckpt_path}")
+    return model
+
+
+def _render_panel(ax, result, norm_mean, norm_std, image_size):
+    """Dispatch to the correct vis_* function based on task_name."""
+    img = denormalize_image(result['image_tensor'], mean=norm_mean, std=norm_std)
+    tname = result['task_name']
+    if tname == 'classification':
+        vis_classification(ax, img, result['label'], result['output'],
+                           result['task_id'], result['score'])
+    elif tname == 'segmentation':
+        vis_segmentation(ax, img, result['label'], result['output'],
+                         result['task_id'], result['score'])
+    elif tname == 'detection':
+        vis_detection(ax, img, result['label'], result['output'],
+                      result['task_id'], result['score'], image_size)
+    elif tname == 'Regression':
+        vis_regression(ax, img, result['label'], result['output'],
+                       result['task_id'], result['score'], image_size)
+
+
+def _row_best_col(model_labels, results_by_label, task_id):
+    """Return index of the model that scored highest for this task, or -1 if none."""
+    scores = []
+    for lbl in model_labels:
+        r = results_by_label.get(lbl, {}).get(task_id)
+        scores.append(r['score'] if r is not None else float('-inf'))
+    if not scores or max(scores) == float('-inf'):
+        return -1
+    return int(np.argmax(scores))
+
+
+def visualize_comparison_per_type(all_results, task_configs, save_dir,
+                                   norm_mean, norm_std, image_size, model_labels):
+    """One figure per task type. Rows = task_ids, columns = models. Marks the
+    best-performing model per row with a ★ in its title."""
+    type_to_ids = defaultdict(list)
+    for tc in task_configs:
+        type_to_ids[tc['task_name'].lower()].append(tc['task_id'])
+
+    for type_key, task_ids in type_to_ids.items():
+        task_ids = sorted(task_ids)
+        n_tasks = len(task_ids)
+        n_models = len(model_labels)
+        if n_tasks == 0 or n_models == 0:
+            continue
+
+        cell = 3.8
+        fig, axes = plt.subplots(n_tasks, n_models, squeeze=False,
+                                 figsize=(cell * n_models, cell * n_tasks))
+
+        for col, label in enumerate(model_labels):
+            axes[0][col].annotate(label,
+                                  xy=(0.5, 1.18), xycoords='axes fraction',
+                                  ha='center', va='bottom',
+                                  fontsize=14, fontweight='bold')
+
+        for row, tid in enumerate(task_ids):
+            best_col = _row_best_col(model_labels, all_results, tid) if n_models > 1 else -1
+            for col, label in enumerate(model_labels):
+                ax = axes[row][col]
+                r = all_results.get(label, {}).get(tid)
+                if r is None:
+                    ax.text(0.5, 0.5, 'N/A', ha='center', va='center',
+                            transform=ax.transAxes)
+                    ax.axis('off')
+                    continue
+                _render_panel(ax, r, norm_mean, norm_std, image_size)
+                if col == best_col:
+                    existing = ax.get_title()
+                    ax.set_title(f"★ {existing}", fontsize=9, fontweight='bold',
+                                 color='darkgreen')
+
+        fig.suptitle(f"Model Comparison — {type_key.capitalize()}",
+                     fontsize=18, fontweight='bold', y=1.0)
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
+        save_path = os.path.join(save_dir, f'compare_{type_key}.png')
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"  Saved: {save_path}")
+
+
+def visualize_comparison_per_task(all_results, task_configs, save_dir,
+                                   norm_mean, norm_std, image_size, model_labels):
+    """One small figure per task (1 × N_models). Convenient for paper insets."""
+    per_task_dir = os.path.join(save_dir, 'per_task')
+    os.makedirs(per_task_dir, exist_ok=True)
+    task_ids = sorted({tc['task_id'] for tc in task_configs})
+    for tid in task_ids:
+        if not any(tid in all_results.get(lbl, {}) for lbl in model_labels):
+            continue
+        n_models = len(model_labels)
+        cell = 4.0
+        fig, axes = plt.subplots(1, n_models, squeeze=False,
+                                 figsize=(cell * n_models, cell))
+        best_col = _row_best_col(model_labels, all_results, tid) if n_models > 1 else -1
+        for col, label in enumerate(model_labels):
+            ax = axes[0][col]
+            r = all_results.get(label, {}).get(tid)
+            if r is None:
+                ax.text(0.5, 0.5, 'N/A', ha='center', va='center',
+                        transform=ax.transAxes)
+                ax.axis('off')
+                continue
+            _render_panel(ax, r, norm_mean, norm_std, image_size)
+            existing = ax.get_title()
+            tag = f"[{label}]"
+            if col == best_col:
+                tag = f"★ {tag}"
+            ax.set_title(f"{tag}\n{existing}", fontsize=9, fontweight='bold',
+                         color='darkgreen' if col == best_col else 'black')
+        fig.suptitle(tid, fontsize=14, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.92])
+        save_path = os.path.join(per_task_dir, f'{tid}.png')
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+    print(f"  Per-task figures saved to: {per_task_dir}")
+
+
+def compare_models_on_same_samples(model_dirs, model_labels, data_root, save_dir,
+                                    compare_seed, device):
+    """Run multiple checkpoints on a deterministic 1-per-task validation subset
+    and render side-by-side comparison figures.
+
+    The picked images are reproducible across independent runs because:
+      (1) the val split is rebuilt from the first model's config seed, and
+      (2) `compare_seed` drives a local RandomState applied to a sort-stable
+          (task_id, image_path) ordering of the val set.
+    """
+    if not model_dirs:
+        print("ERROR: No model directories provided for comparison.")
+        return
+
+    first_cfg_path = os.path.join(model_dirs[0], 'config.yaml')
+    if not os.path.isfile(first_cfg_path):
+        print(f"ERROR: config.yaml not found in {model_dirs[0]}")
+        return
+    base_config = load_config(first_cfg_path)
+    base_config.config['data']['root_path'] = data_root
+    base_config.data_root = data_root
+    # Compare needs all task heads; disable single-task filter from the ref config
+    base_config.config.setdefault('training', {}).setdefault('single_task', {})['enabled'] = False
+
+    set_seed(base_config.seed)
+    val_dataset, task_configs, norm_mean, norm_std = build_val_dataset(base_config, data_root)
+    print(f"Reference val set: {len(val_dataset)} samples across {len(task_configs)} tasks")
+
+    picks = pick_fixed_sample_per_task(val_dataset, seed=compare_seed)
+    print(f"Picked {len(picks)} samples (1 per task) with compare_seed={compare_seed}")
+    sample_indices = list(picks.values())
+
+    all_results = {}
+    for mdir, label in zip(model_dirs, model_labels):
+        print(f"\n=== Model: {label}  ({mdir}) ===")
+        model = load_trained_model(mdir, data_root, task_configs, device)
+        if model is None:
+            continue
+        results = run_inference_on_indices(model, val_dataset, sample_indices,
+                                           device, task_configs)
+        all_results[label] = {r['task_id']: r for r in results}
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if not all_results:
+        print("No models loaded successfully; nothing to visualize.")
+        return
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Manifest pins the exact images that were used — makes the run auditable
+    manifest = {}
+    for tid, pos in picks.items():
+        row = val_dataset.dataframe.iloc[pos]
+        manifest[tid] = {
+            'position': int(pos),
+            'image_path': str(row['image_path']),
+            'task_name': str(row['task_name']),
+        }
+    with open(os.path.join(save_dir, 'compare_manifest.json'), 'w', encoding='utf-8') as f:
+        json.dump({'compare_seed': compare_seed,
+                   'models': dict(zip(model_labels, model_dirs)),
+                   'samples': manifest},
+                  f, indent=2, ensure_ascii=False)
+
+    image_size = (base_config.image_size, base_config.image_size)
+    valid_labels = [lbl for lbl in model_labels if lbl in all_results]
+    print("\nRendering comparison figures...")
+    visualize_comparison_per_type(all_results, task_configs, save_dir,
+                                  norm_mean, norm_std, image_size, valid_labels)
+    visualize_comparison_per_task(all_results, task_configs, save_dir,
+                                  norm_mean, norm_std, image_size, valid_labels)
+    print(f"\nDone! Comparison results saved to: {save_dir}")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# CLI entry point
+# ──────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(description='Visualize multi-task model predictions')
-    parser.add_argument('--output_dir', type=str, required=True,
+    parser.add_argument('--output_dir', type=str, default=None,
                         help='Path to the training output folder containing best_model.pth and config.yaml')
     parser.add_argument('--task_id', type=str, default=None,
                         help='Specific task_id to visualize (e.g., breast_2cls)')
@@ -482,7 +881,57 @@ def main():
                         help='Device to use (default: auto-detect)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed for sampling (default: use config seed)')
+    parser.add_argument('--overview_only', action='store_true',
+                        help='Generate dataset overview with GT annotations only (no model needed)')
+    parser.add_argument('--save_dir', type=str, default='visualizations/overview',
+                        help='Output directory for --overview_only / --compare_models figures')
+    parser.add_argument('--compare_models', type=str, nargs='+', default=None,
+                        help='Compare multiple models on the SAME deterministically-selected '
+                             'test images (one per task_id, 27 in total). Pass the output dirs '
+                             'space-separated, e.g. --compare_models outputs/expA outputs/expB')
+    parser.add_argument('--compare_labels', type=str, nargs='+', default=None,
+                        help='Optional display labels for --compare_models (must match count). '
+                             'Defaults to folder basenames.')
+    parser.add_argument('--compare_seed', type=int, default=42,
+                        help='Seed for deterministic sample picking in compare mode. Same seed '
+                             '+ same val split = same 27 images across independent runs.')
     args = parser.parse_args()
+
+    # ── Model comparison mode (multiple checkpoints, identical samples) ──
+    if args.compare_models:
+        labels = (args.compare_labels
+                  or [os.path.basename(os.path.normpath(d)) for d in args.compare_models])
+        if len(labels) != len(args.compare_models):
+            print(f"ERROR: --compare_labels count ({len(labels)}) must match "
+                  f"--compare_models count ({len(args.compare_models)})")
+            sys.exit(1)
+        if args.device:
+            device = torch.device(args.device)
+        else:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Device: {device}")
+
+        # Use a comparison-specific default save dir when user kept the overview default
+        save_dir = args.save_dir
+        if save_dir == 'visualizations/overview':
+            save_dir = 'visualizations/comparison'
+
+        compare_models_on_same_samples(
+            model_dirs=args.compare_models,
+            model_labels=labels,
+            data_root=args.data_root,
+            save_dir=save_dir,
+            compare_seed=args.compare_seed,
+            device=device,
+        )
+        return
+
+    # ── GT-only dataset overview mode ────────────────────────────────
+    if args.overview_only or args.output_dir is None:
+        print("Generating dataset overview (GT annotations only, no model required)...")
+        visualize_dataset_overview(args.data_root, args.save_dir)
+        print(f"\nDone! Overview figures saved to: {args.save_dir}")
+        return
 
     # ── Locate model and config ──────────────────────────────────────
     output_dir = args.output_dir

@@ -23,7 +23,7 @@ from configs import load_config
 from models import build_model
 from losses import build_all_losses
 from data import MultiTaskDataset, MultiTaskUniformSampler
-from utils import set_seed, multi_task_collate_fn
+from utils import set_seed, multi_task_collate_fn, summarize_parameter_groups
 from utils.common import gaussian_radius, draw_gaussian
 from utils.logger import TrainingLogger
 from metrics import evaluate
@@ -587,8 +587,21 @@ def main(config_path=None):
     model = build_model(config).to(config.device)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.set_model_stats(total_params=total_params, trainable_params=trainable_params)
+    param_groups = summarize_parameter_groups(model)
+    logger.set_model_stats(
+        total_params=total_params,
+        trainable_params=trainable_params,
+        groups=param_groups,
+    )
     print(f"Model Parameters: total={total_params:,}, trainable={trainable_params:,}")
+    print("Parameter breakdown by group:")
+    for group_name, stats in param_groups.items():
+        if stats['total'] == 0:
+            continue
+        print(
+            f"  {group_name:<20s} total={stats['total']:>14,}  "
+            f"trainable={stats['trainable']:>14,}"
+        )
     
     # Build losses
     loss_functions, loss_weights = build_all_losses(config)

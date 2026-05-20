@@ -41,7 +41,8 @@ class TrainingLogger:
                 'start_time': datetime.now().isoformat(),
                 'timestamp': self.timestamp,
                 'model_params_total': None,
-                'model_params_trainable': None
+                'model_params_trainable': None,
+                'model_param_groups': None,
             },
             'epochs': []
         }
@@ -317,12 +318,28 @@ class TrainingLogger:
             df = pd.DataFrame(rows)
             df.to_csv(self.moe_stats_csv, index=False, encoding='utf-8')
 
-    def set_model_stats(self, total_params, trainable_params=None):
-        """Record model parameter statistics."""
+    def set_model_stats(self, total_params, trainable_params=None, groups=None):
+        """Record model parameter statistics.
+
+        Args:
+            total_params: Total parameter count (sum of p.numel() over all params).
+            trainable_params: Subset where requires_grad=True.
+            groups: Optional dict from utils.summarize_parameter_groups, mapping
+                group name -> {'total': int, 'trainable': int}. When provided,
+                a per-group breakdown is written into model_runtime_summary.txt.
+        """
         total_params = int(total_params) if total_params is not None else None
         trainable_params = int(trainable_params) if trainable_params is not None else None
         self.history['metadata']['model_params_total'] = total_params
         self.history['metadata']['model_params_trainable'] = trainable_params
+        if groups is not None:
+            normalized = {}
+            for name, stats in groups.items():
+                normalized[str(name)] = {
+                    'total': int(stats.get('total', 0) or 0),
+                    'trainable': int(stats.get('trainable', 0) or 0),
+                }
+            self.history['metadata']['model_param_groups'] = normalized
         self._save_runtime_summary_txt()
         self._save_json()
 
@@ -392,6 +409,31 @@ class TrainingLogger:
         lines.append(
             f"  - Non-trainable Parameters: {f'{int(non_trainable_params):,}' if non_trainable_params is not None else 'N/A'}"
         )
+
+        param_groups = metadata.get('model_param_groups')
+        if param_groups:
+            lines.append("")
+            lines.append("Parameter Breakdown (by group):")
+            header = f"  {'Group':<20s} {'Total':>15s} {'Trainable':>15s}"
+            lines.append(header)
+            lines.append("  " + "-" * (len(header) - 2))
+            sum_total = 0
+            sum_trainable = 0
+            for group_name, stats in param_groups.items():
+                g_total = int(stats.get('total', 0) or 0)
+                g_trainable = int(stats.get('trainable', 0) or 0)
+                sum_total += g_total
+                sum_trainable += g_trainable
+                if g_total == 0:
+                    continue  # hide empty groups to keep the table compact
+                lines.append(
+                    f"  {group_name:<20s} {g_total:>15,} {g_trainable:>15,}"
+                )
+            lines.append("  " + "-" * (len(header) - 2))
+            lines.append(
+                f"  {'TOTAL':<20s} {sum_total:>15,} {sum_trainable:>15,}"
+            )
+
         lines.append("")
         lines.append("Runtime:")
         lines.append(f"  - Total Training Time: {self._format_seconds(runtime.get('total_train_time'))}")

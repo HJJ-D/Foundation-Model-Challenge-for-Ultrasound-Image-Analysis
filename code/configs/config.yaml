@@ -109,7 +109,7 @@ model:
         # 实际有效幅度 ≤ 1.0。
 
   decoder:
-    type: dpt          # fpn | dpt
+    type: fpn          # fpn | dpt
     pyramid_channels: 256
     segmentation_channels: 128
     dropout: 0.2

@@ -36,6 +36,66 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+# Group order is significant: it's the order shown in the runtime summary.
+_PARAM_GROUP_ORDER = (
+    'encoder.backbone',
+    'encoder.adapter',
+    'encoder.lora',
+    'decoder',
+    'heads',
+    'conditioning',
+)
+
+
+def _classify_parameter(name: str) -> str:
+    """Bin a qualified parameter name into a logical model group.
+
+    Classification is name-based to stay robust across encoder variants
+    (Dinov3 / ViTAdapter / Swin / smp encoders) without per-architecture
+    branching. ``lora_`` is checked first so injected LoRA params land in
+    the lora bucket regardless of where they live in the encoder tree.
+    """
+    if name.startswith('encoder.'):
+        if 'lora_' in name:
+            return 'encoder.lora'
+        # timm backbones live at encoder.model.* (DINOv3, swin via timm)
+        # or encoder.vit.* (ViTAdapterEncoder).
+        if name.startswith(('encoder.model.', 'encoder.vit.')):
+            return 'encoder.backbone'
+        return 'encoder.adapter'
+    if name.startswith((
+        'fpn_decoder_seg.', 'fpn_decoder_det.',
+        'fpn_decoder_cls.', 'fpn_decoder_reg.',
+    )):
+        return 'decoder'
+    if name.startswith('heads.'):
+        return 'heads'
+    return 'conditioning'
+
+
+def summarize_parameter_groups(model):
+    """Return per-group {total, trainable} parameter counts.
+
+    Uses ``model.named_parameters()`` (which already deduplicates shared
+    parameters by tensor identity), so decoders shared across task types
+    are counted once. Each parameter is binned by ``_classify_parameter``.
+
+    Returns:
+        dict ordered by ``_PARAM_GROUP_ORDER``, mapping group name to
+        ``{'total': int, 'trainable': int}``.
+    """
+    groups = {g: [0, 0] for g in _PARAM_GROUP_ORDER}
+    for name, p in model.named_parameters():
+        g = _classify_parameter(name)
+        if g not in groups:
+            groups[g] = [0, 0]
+        n = p.numel()
+        groups[g][0] += n
+        if p.requires_grad:
+            groups[g][1] += n
+    return {g: {'total': t, 'trainable': r} for g, (t, r) in groups.items()}
+
+
 def get_lr(optimizer):
     """Get current learning rate from optimizer."""
     for param_group in optimizer.param_groups:
